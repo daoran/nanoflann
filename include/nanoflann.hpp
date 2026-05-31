@@ -37,11 +37,24 @@
  *  nanoflann does not require compiling or installing, just an
  *  #include <nanoflann.hpp> in your code.
  *
- *  Macros that are observed in this file:
- *  - NANOFLANN_NO_THREADS: If defined, single thread will be enforced.
- *  - NANOFLANN_FIRST_MATCH: If defined, in case of a tie in distances the item with the smallest
- *    index will be returned.
- *  - NANOFLANN_NODE_ALIGNMENT: The memory alignment, in bytes, for kd-tree nodes. Default: 16
+ *  Macros that can be defined by the user to configure nanoflann:
+ *  - NANOFLANN_NO_THREADS: If defined, multithreading is disabled, so the
+ *    library can be used without linking against a threads library. Requesting a
+ *    multi-threaded index build (`n_thread_build != 1`) then throws.
+ *  - NANOFLANN_FIRST_MATCH: If defined, in case of a tie in distances the item
+ *    with the smallest index will be returned.
+ *  - NANOFLANN_NODE_ALIGNMENT: The memory alignment, in bytes, for kd-tree
+ *    nodes. Default: 16.
+ *
+ *  Macros defined internally by nanoflann (not meant to be set by the user):
+ *  - NANOFLANN_RESTRICT: Expands to the compiler-specific `restrict` pointer
+ *    qualifier (`__restrict__`, `__restrict`) when available, empty otherwise.
+ *  - NANOFLANN_NODISCARD: Expands to `[[nodiscard]]` when the compiler supports
+ *    it, empty otherwise.
+ *  - NANOFLANN_VERSION: Library version as 0xMmP (M=Major, m=minor, P=patch).
+ *
+ *  See the [README](https://github.com/jlblancoc/nanoflann#readme) for usage
+ *  details and examples.
  *
  *  See:
  *   - [Online README](https://github.com/jlblancoc/nanoflann)
@@ -1659,6 +1672,18 @@ class KDTreeBaseClass
  * nanoflann::metric_L2, nanoflann::metric_L2_Simple, etc. \tparam DIM
  * Dimensionality of data points (e.g. 3 for 3D points) \tparam IndexType Will
  * be typically size_t or int
+ *
+ * \note Threading guarantees:
+ *   - Index build: passing `n_thread_build > 1` in the params parallelizes the
+ *     build using `std::async` (unless NANOFLANN_NO_THREADS is defined, in which
+ *     case requesting more than one thread throws).
+ *   - Queries (`findNeighbors`, `knnSearch`, `radiusSearch`, `rknnSearch`) are
+ *     `const` and thread-safe for concurrent readers: multiple threads may query
+ *     the same index simultaneously, as long as no thread is concurrently
+ *     (re)building or modifying it.
+ *   - The internal `PooledAllocator` is NOT thread-safe; building an index from
+ *     multiple threads, or mixing queries with a concurrent build, is not
+ *     supported.
  */
 template <typename Distance, class DatasetAdaptor, int32_t DIM = -1, typename index_t = uint32_t>
 class KDTreeSingleIndexAdaptor

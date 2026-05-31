@@ -183,6 +183,13 @@ The nanoflann port in vcpkg is kept up to date by Microsoft team members and com
 
   * `NANOFLANN_FIRST_MATCH`: If defined and two points have the same distance, the one with the lowest-index will be returned first. Otherwise there is no particular order.
   * `NANOFLANN_NO_THREADS`: If defined, multithreading capabilities will be disabled, so that the library can be used without linking with pthreads. If one tries to use multiple threads, an exception will be thrown.
+  * `NANOFLANN_NODE_ALIGNMENT`: The memory alignment, in bytes, used for KD-tree nodes. Defaults to `16`.
+
+### 1.10. Thread safety
+
+  * **Index build**: pass `n_thread_build > 1` in `KDTreeSingleIndexAdaptorParams` to parallelize the build via `std::async` (unless `NANOFLANN_NO_THREADS` is defined).
+  * **Queries**: `findNeighbors()`, `knnSearch()`, `radiusSearch()` and `rknnSearch()` are `const` and safe to call concurrently from multiple threads on the same index, as long as no thread is concurrently building or modifying it.
+  * The internal `PooledAllocator` is **not** thread-safe, so building an index from multiple threads (or mixing queries with an in-progress build) is not supported.
 
 ------
 
