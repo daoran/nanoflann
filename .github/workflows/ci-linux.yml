@@ -5,50 +5,57 @@ on: [push, pull_request]
 
 jobs:
   build:
-    name: ${{ matrix.name }} ${{ matrix.build_type }}
+    name: ${{ matrix.name }} ${{ matrix.build_type || 'Release' }}
     runs-on: ${{ matrix.os }}
 
     env:
       CTEST_OUTPUT_ON_FAILURE: ON
       CTEST_PARALLEL_LEVEL: 1
-      CMAKE_BUILD_TYPE: ${{ matrix.build_type }}
+      CMAKE_BUILD_TYPE: ${{ matrix.build_type || 'Release' }}
       VERBOSE: 1 # to show all cmake scripts debug info
 
     strategy:
       fail-fast: false
       matrix:
-        # Github Actions requires a single row to be added to the build matrix.
-        # See https://help.github.com/en/articles/workflow-syntax-for-github-actions.
-        name:
-          [
-            ubuntu-22.04-gcc,
-            ubuntu-22.04-clang,
-            ubuntu-24.04-gcc,
-            ubuntu-24.04-clang,
-          ]
-
-        build_type: [Release]
         include:
+          # Standard Base Builds (Defaults to C++11)
           - name: ubuntu-22.04-gcc
             os: ubuntu-22.04
             compiler: gcc
-
+            cxx_std: 11
           - name: ubuntu-22.04-clang
             os: ubuntu-22.04
             compiler: clang
-
+            cxx_std: 11
           - name: ubuntu-24.04-clang
             os: ubuntu-24.04
             compiler: clang
+            cxx_std: 17
 
-          - name: ubuntu-24.04-gcc
+          # Specific GCC C++ Standard Tests (ubuntu-24.04)
+          - name: ubuntu-24.04-gcc-cpp11
             os: ubuntu-24.04
             compiler: gcc
+            cxx_std: 11
+          - name: ubuntu-24.04-gcc-cpp17
+            os: ubuntu-24.04
+            compiler: gcc
+            cxx_std: 17
+          - name: ubuntu-24.04-gcc-cpp20
+            os: ubuntu-24.04
+            compiler: gcc
+            cxx_std: 20
+          - name: ubuntu-24.04-gcc-cpp23
+            os: ubuntu-24.04
+            compiler: gcc
+            cxx_std: 23
 
+          # Coverage Build
           - name: ubuntu-24.04-coverage
             os: ubuntu-24.04
             compiler: gcc
             build_type: Coverage
+            cxx_std: 11
 
     steps:
       - name: Checkout
@@ -78,8 +85,11 @@ jobs:
           fi
 
       - name: CMake configure
+        # Added the CMAKE_CXX_STANDARD injection here
         run: |
           cmake -DCMAKE_VERBOSE_MAKEFILE=ON \
+                -DCMAKE_CXX_STANDARD=${{ matrix.cxx_std }} \
+                -DCMAKE_CXX_STANDARD_REQUIRED=ON \
                 -H. -Bbuild
 
       - name: Build
@@ -99,7 +109,7 @@ jobs:
         run: |
           # 1. Capture coverage data from the build directory
           #    lcov finds all the .gcno and .gcda files
-          lcov --capture --directory build/ --output-file coverage.info --ignore-errors mismatch
+          lcov --capture --directory build/ --output-file coverage.info --ignore-errors mismatch,negative
 
           # 2. Filter to *only* include the main header file
           #    This fulfills your request to not include examples/tests
