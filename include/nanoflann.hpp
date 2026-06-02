@@ -901,7 +901,7 @@ class PooledAllocator
      * Returns a pointer to a piece of new memory of the given size in bytes
      * allocated from the pool.
      */
-    void* malloc(const size_t req_size)
+    void* allocateBytes(const size_t req_size)
     {
         /* Round size up to a multiple of wordsize.  The following expression
             only works for WORDSIZE that is a power of 2, by masking last bits
@@ -952,7 +952,7 @@ class PooledAllocator
     template <typename T>
     T* allocate(const size_t count = 1)
     {
-        T* mem = static_cast<T*>(this->malloc(sizeof(T) * count));
+        T* mem = static_cast<T*>(this->allocateBytes(sizeof(T) * count));
         return mem;
     }
 };
