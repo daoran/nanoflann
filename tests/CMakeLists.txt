@@ -21,6 +21,8 @@ else()
     # Mark local GTest headers as SYSTEM to suppress pedantic warnings from them
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_include_directories(${GTEST_TARGET} SYSTEM INTERFACE "gtest-1.8.0/include")
+    else()
+        target_include_directories(${GTEST_TARGET} INTERFACE "gtest-1.8.0/include")
     endif()
 endif()
 
