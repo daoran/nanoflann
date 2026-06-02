@@ -687,19 +687,21 @@ struct SO2_Adaptor
         return accum_dist(a[size - 1], data_source.kdtree_get_pt(b_idx, size - 1), size - 1);
     }
 
-    /** Note: this assumes that input angles are already in the range [-pi,pi]
+    /** Returns the absolute shortest angular distance between a and b,
+     *  assuming both are in [-pi, pi].  The result is in [0, pi], which
+     *  satisfies the non-negativity requirement of a kd-tree metric and
+     *  gives correct nearest-neighbour pruning.
      */
     template <typename U, typename V>
     inline DistanceType accum_dist(const U a, const V b, const size_t) const
     {
-        DistanceType result = DistanceType();
-        DistanceType PI     = pi_const<DistanceType>();
-        result              = b - a;
-        if (result > PI)
-            result -= 2 * PI;
-        else if (result < -PI)
-            result += 2 * PI;
-        return result;
+        DistanceType diff = static_cast<DistanceType>(b) - static_cast<DistanceType>(a);
+        const DistanceType PI = pi_const<DistanceType>();
+        if (diff > PI)
+            diff -= 2 * PI;
+        else if (diff < -PI)
+            diff += 2 * PI;
+        return diff < DistanceType(0) ? -diff : diff;  // abs without <cmath> dependency
     }
 };
 
@@ -799,6 +801,13 @@ inline std::underlying_type<KDTreeSingleIndexAdaptorFlags>::type operator&(
 {
     using underlying = typename std::underlying_type<KDTreeSingleIndexAdaptorFlags>::type;
     return static_cast<underlying>(lhs) & static_cast<underlying>(rhs);
+}
+
+/** Returns true if \a f has the given \a flag bit set.
+ *  Prefer this over the raw operator& in boolean contexts. */
+inline bool has_flag(KDTreeSingleIndexAdaptorFlags f, KDTreeSingleIndexAdaptorFlags flag)
+{
+    return (f & flag) != 0;
 }
 
 /**  Parameters (see README.md) */
@@ -901,7 +910,7 @@ class PooledAllocator
      * Returns a pointer to a piece of new memory of the given size in bytes
      * allocated from the pool.
      */
-    void* malloc(const size_t req_size)
+    void* allocateBytes(const size_t req_size)
     {
         /* Round size up to a multiple of wordsize.  The following expression
             only works for WORDSIZE that is a power of 2, by masking last bits
@@ -952,7 +961,7 @@ class PooledAllocator
     template <typename T>
     T* allocate(const size_t count = 1)
     {
-        T* mem = static_cast<T*>(this->malloc(sizeof(T) * count));
+        T* mem = static_cast<T*>(this->allocateBytes(sizeof(T) * count));
         return mem;
     }
 };
@@ -1095,10 +1104,10 @@ class KDTreeBaseClass
     PooledAllocator pool_;
 
     /** Returns number of points in dataset  */
-    Size size(const Derived& obj) const { return obj.size_; }
+    Size size(const Derived& obj) const noexcept { return obj.size_; }
 
     /** Returns the length of each point in the dataset */
-    Size veclen(const Derived& obj) const { return DIM > 0 ? DIM : obj.dim_; }
+    Size veclen(const Derived& obj) const noexcept { return DIM > 0 ? DIM : obj.dim_; }
 
     /// Helper accessor to the dataset points:
     ElementType dataset_get(const Derived& obj, IndexType element, Dimension component) const
@@ -1864,7 +1873,7 @@ class KDTreeSingleIndexAdaptor
             Base::n_thread_build_ = std::max(std::thread::hardware_concurrency(), 1u);
         }
 
-        if (!(params.flags & KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex))
+        if (!has_flag(params.flags, KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex))
         {
             // Build KD-tree:
             buildIndex();
