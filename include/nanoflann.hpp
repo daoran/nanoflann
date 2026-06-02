@@ -687,19 +687,21 @@ struct SO2_Adaptor
         return accum_dist(a[size - 1], data_source.kdtree_get_pt(b_idx, size - 1), size - 1);
     }
 
-    /** Note: this assumes that input angles are already in the range [-pi,pi]
+    /** Returns the absolute shortest angular distance between a and b,
+     *  assuming both are in [-pi, pi].  The result is in [0, pi], which
+     *  satisfies the non-negativity requirement of a kd-tree metric and
+     *  gives correct nearest-neighbour pruning.
      */
     template <typename U, typename V>
     inline DistanceType accum_dist(const U a, const V b, const size_t) const
     {
-        DistanceType result = DistanceType();
-        DistanceType PI     = pi_const<DistanceType>();
-        result              = b - a;
-        if (result > PI)
-            result -= 2 * PI;
-        else if (result < -PI)
-            result += 2 * PI;
-        return result;
+        DistanceType diff = static_cast<DistanceType>(b) - static_cast<DistanceType>(a);
+        const DistanceType PI = pi_const<DistanceType>();
+        if (diff > PI)
+            diff -= 2 * PI;
+        else if (diff < -PI)
+            diff += 2 * PI;
+        return diff < DistanceType(0) ? -diff : diff;  // abs without <cmath> dependency
     }
 };
 

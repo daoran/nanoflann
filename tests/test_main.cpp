@@ -582,18 +582,19 @@ void SO2_vs_bruteforce_test(const size_t nSamples)
     resultSet.init(&ret_indexes[0], &out_dists_sqr[0]);
     index.findNeighbors(resultSet, &query_pt[0]);
 
-    // Brute force:
+    // Brute force: find nearest neighbour by absolute angular distance,
+    // matching SO2_Adaptor::accum_dist which returns |b - a| wrapped.
     double min_dist_SO2 = std::numeric_limits<double>::max();
     size_t min_idx      = std::numeric_limits<size_t>::max();
     {
         for (size_t i = 0; i < nSamples; i++)
         {
-            double dist = 0.0;
-            dist        = cloud.kdtree_get_pt(i, 0) - query_pt[0];
+            double dist = cloud.kdtree_get_pt(i, 0) - query_pt[0];
             if (dist > nanoflann::pi_const<double>())
                 dist -= 2 * nanoflann::pi_const<double>();
             else if (dist < -nanoflann::pi_const<double>())
                 dist += 2 * nanoflann::pi_const<double>();
+            if (dist < 0) dist = -dist;  // absolute angular distance
             if (dist < min_dist_SO2)
             {
                 min_dist_SO2 = dist;
