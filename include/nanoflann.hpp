@@ -801,6 +801,13 @@ inline std::underlying_type<KDTreeSingleIndexAdaptorFlags>::type operator&(
     return static_cast<underlying>(lhs) & static_cast<underlying>(rhs);
 }
 
+/** Returns true if \a f has the given \a flag bit set.
+ *  Prefer this over the raw operator& in boolean contexts. */
+inline bool has_flag(KDTreeSingleIndexAdaptorFlags f, KDTreeSingleIndexAdaptorFlags flag)
+{
+    return (f & flag) != 0;
+}
+
 /**  Parameters (see README.md) */
 struct KDTreeSingleIndexAdaptorParams
 {
@@ -1095,10 +1102,10 @@ class KDTreeBaseClass
     PooledAllocator pool_;
 
     /** Returns number of points in dataset  */
-    Size size(const Derived& obj) const { return obj.size_; }
+    Size size(const Derived& obj) const noexcept { return obj.size_; }
 
     /** Returns the length of each point in the dataset */
-    Size veclen(const Derived& obj) const { return DIM > 0 ? DIM : obj.dim_; }
+    Size veclen(const Derived& obj) const noexcept { return DIM > 0 ? DIM : obj.dim_; }
 
     /// Helper accessor to the dataset points:
     ElementType dataset_get(const Derived& obj, IndexType element, Dimension component) const
@@ -1864,7 +1871,7 @@ class KDTreeSingleIndexAdaptor
             Base::n_thread_build_ = std::max(std::thread::hardware_concurrency(), 1u);
         }
 
-        if (!(params.flags & KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex))
+        if (!has_flag(params.flags, KDTreeSingleIndexAdaptorFlags::SkipInitialBuildIndex))
         {
             // Build KD-tree:
             buildIndex();
