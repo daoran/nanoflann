@@ -1261,11 +1261,20 @@ class KDTreeBaseClass
      * @param bbox bounding box used as input for splitting and output for
      * parent node
      */
-    NodePtr divideTree(Derived& obj, const Offset left, const Offset right, BoundingBox& bbox)
+    /**
+     * Initialize a freshly-allocated node while building the tree: either turn
+     * it into a leaf node (computing the leaf bounding-box) or compute the
+     * split plane for an interior node. Shared by the sequential and concurrent
+     * builders, which differ only in how they recurse.
+     *
+     * @return true if the node became a leaf (no further recursion needed),
+     *         false if it is an interior node and \a idx / \a cutfeat / \a cutval
+     *         describe the split plane.
+     */
+    bool makeNode(
+        Derived& obj, NodePtr node, const Offset left, const Offset right, BoundingBox& bbox,
+        Offset& idx, Dimension& cutfeat, DistanceType& cutval)
     {
-        assert(static_cast<Size>(obj.vAcc_.at(left)) < obj.dataset_.kdtree_get_point_count());
-
-        NodePtr    node = obj.pool_.template allocate<Node>();  // allocate memory
         const Dimension dims = static_cast<Dimension>(veclen(obj));
 
         /* If too few exemplars remain, then make this a leaf node. */
@@ -1290,36 +1299,56 @@ class KDTreeBaseClass
                     if (bbox[i].high < val) bbox[i].high = val;
                 }
             }
+            return true;
         }
-        else
+
+        /* Determine the index, dimension and value for split plane */
+        middleSplit_(obj, left, right - left, idx, cutfeat, cutval, bbox);
+        node->node_type.sub.divfeat = cutfeat;
+        return false;
+    }
+
+    /**
+     * After both children of an interior node have been built, record the split
+     * planes and expand \a bbox to the union of the children bounding-boxes.
+     * Shared by the sequential and concurrent builders.
+     */
+    void finalizeSplitNode(
+        Derived& obj, NodePtr node, const Dimension cutfeat, const BoundingBox& left_bbox,
+        const BoundingBox& right_bbox, BoundingBox& bbox)
+    {
+        node->node_type.sub.divlow  = left_bbox[cutfeat].high;
+        node->node_type.sub.divhigh = right_bbox[cutfeat].low;
+
+        const Dimension dims = static_cast<Dimension>(veclen(obj));
+        for (Dimension i = 0; i < dims; ++i)
         {
-            /* Determine the index, dimension and value for split plane */
-            Offset       idx;
-            Dimension    cutfeat;
-            DistanceType cutval;
-            middleSplit_(obj, left, right - left, idx, cutfeat, cutval, bbox);
-
-            node->node_type.sub.divfeat = cutfeat;
-
-            /* Recurse on left */
-            BoundingBox left_bbox(bbox);
-            left_bbox[cutfeat].high = cutval;
-            node->child1            = this->divideTree(obj, left, left + idx, left_bbox);
-
-            /* Recurse on right */
-            BoundingBox right_bbox(bbox);
-            right_bbox[cutfeat].low = cutval;
-            node->child2            = this->divideTree(obj, left + idx, right, right_bbox);
-
-            node->node_type.sub.divlow  = left_bbox[cutfeat].high;
-            node->node_type.sub.divhigh = right_bbox[cutfeat].low;
-
-            for (Dimension i = 0; i < dims; ++i)
-            {
-                bbox[i].low  = std::min(left_bbox[i].low, right_bbox[i].low);
-                bbox[i].high = std::max(left_bbox[i].high, right_bbox[i].high);
-            }
+            bbox[i].low  = std::min(left_bbox[i].low, right_bbox[i].low);
+            bbox[i].high = std::max(left_bbox[i].high, right_bbox[i].high);
         }
+    }
+
+    NodePtr divideTree(Derived& obj, const Offset left, const Offset right, BoundingBox& bbox)
+    {
+        assert(static_cast<Size>(obj.vAcc_.at(left)) < obj.dataset_.kdtree_get_point_count());
+
+        NodePtr      node = obj.pool_.template allocate<Node>();  // allocate memory
+        Offset       idx;
+        Dimension    cutfeat;
+        DistanceType cutval;
+        if (makeNode(obj, node, left, right, bbox, idx, cutfeat, cutval)) return node;
+
+        /* Recurse on left */
+        BoundingBox left_bbox(bbox);
+        left_bbox[cutfeat].high = cutval;
+        node->child1            = this->divideTree(obj, left, left + idx, left_bbox);
+
+        /* Recurse on right */
+        BoundingBox right_bbox(bbox);
+        right_bbox[cutfeat].low = cutval;
+        node->child2            = this->divideTree(obj, left + idx, right, right_bbox);
+
+        finalizeSplitNode(obj, node, cutfeat, left_bbox, right_bbox, bbox);
 
         return node;
     }
@@ -1344,92 +1373,53 @@ class KDTreeBaseClass
         NodePtr                      node = obj.pool_.template allocate<Node>();  // allocate memory
         lock.unlock();
 
-        const Dimension dims = static_cast<Dimension>(veclen(obj));
+        Offset       idx;
+        Dimension    cutfeat;
+        DistanceType cutval;
+        if (makeNode(obj, node, left, right, bbox, idx, cutfeat, cutval)) return node;
 
-        /* If too few exemplars remain, then make this a leaf node. */
-        if ((right - left) <= static_cast<Offset>(obj.leaf_max_size_))
+        std::future<NodePtr> right_future;
+
+        /* Recurse on right concurrently, if possible */
+
+        BoundingBox right_bbox(bbox);
+        right_bbox[cutfeat].low = cutval;
+        if (++thread_count < n_thread_build_)
         {
-            node->child1 = node->child2 = nullptr; /* Mark as leaf node. */
-            node->node_type.lr.left     = left;
-            node->node_type.lr.right    = right;
+            /* Concurrent thread for right recursion */
 
-            // compute bounding-box of leaf points
-            for (Dimension i = 0; i < dims; ++i)
-            {
-                bbox[i].low  = dataset_get(obj, obj.vAcc_[left], i);
-                bbox[i].high = dataset_get(obj, obj.vAcc_[left], i);
-            }
-            for (Offset k = left + 1; k < right; ++k)
-            {
-                for (Dimension i = 0; i < dims; ++i)
-                {
-                    const auto val = dataset_get(obj, obj.vAcc_[k], i);
-                    if (bbox[i].low > val) bbox[i].low = val;
-                    if (bbox[i].high < val) bbox[i].high = val;
-                }
-            }
+            right_future = std::async(
+                std::launch::async, &KDTreeBaseClass::divideTreeConcurrent, this, std::ref(obj),
+                left + idx, right, std::ref(right_bbox), std::ref(thread_count), std::ref(mutex));
         }
         else
         {
-            /* Determine the index, dimension and value for split plane */
-            Offset       idx;
-            Dimension    cutfeat;
-            DistanceType cutval;
-            middleSplit_(obj, left, right - left, idx, cutfeat, cutval, bbox);
-
-            node->node_type.sub.divfeat = cutfeat;
-
-            std::future<NodePtr> right_future;
-
-            /* Recurse on right concurrently, if possible */
-
-            BoundingBox right_bbox(bbox);
-            right_bbox[cutfeat].low = cutval;
-            if (++thread_count < n_thread_build_)
-            {
-                /* Concurrent thread for right recursion */
-
-                right_future = std::async(
-                    std::launch::async, &KDTreeBaseClass::divideTreeConcurrent, this, std::ref(obj),
-                    left + idx, right, std::ref(right_bbox), std::ref(thread_count),
-                    std::ref(mutex));
-            }
-            else
-            {
-                --thread_count;
-            }
-
-            /* Recurse on left in this thread */
-
-            BoundingBox left_bbox(bbox);
-            left_bbox[cutfeat].high = cutval;
-            node->child1 =
-                this->divideTreeConcurrent(obj, left, left + idx, left_bbox, thread_count, mutex);
-
-            if (right_future.valid())
-            {
-                /* Block and wait for concurrent right from above */
-
-                node->child2 = right_future.get();
-                --thread_count;
-            }
-            else
-            {
-                /* Otherwise, recurse on right in this thread */
-
-                node->child2 = this->divideTreeConcurrent(
-                    obj, left + idx, right, right_bbox, thread_count, mutex);
-            }
-
-            node->node_type.sub.divlow  = left_bbox[cutfeat].high;
-            node->node_type.sub.divhigh = right_bbox[cutfeat].low;
-
-            for (Dimension i = 0; i < dims; ++i)
-            {
-                bbox[i].low  = std::min(left_bbox[i].low, right_bbox[i].low);
-                bbox[i].high = std::max(left_bbox[i].high, right_bbox[i].high);
-            }
+            --thread_count;
         }
+
+        /* Recurse on left in this thread */
+
+        BoundingBox left_bbox(bbox);
+        left_bbox[cutfeat].high = cutval;
+        node->child1 =
+            this->divideTreeConcurrent(obj, left, left + idx, left_bbox, thread_count, mutex);
+
+        if (right_future.valid())
+        {
+            /* Block and wait for concurrent right from above */
+
+            node->child2 = right_future.get();
+            --thread_count;
+        }
+        else
+        {
+            /* Otherwise, recurse on right in this thread */
+
+            node->child2 =
+                this->divideTreeConcurrent(obj, left + idx, right, right_bbox, thread_count, mutex);
+        }
+
+        finalizeSplitNode(obj, node, cutfeat, left_bbox, right_bbox, bbox);
 
         return node;
     }
@@ -2740,6 +2730,14 @@ struct KDTreeEigenMatrixAdaptor
    public:
     /** Deleted copy constructor */
     KDTreeEigenMatrixAdaptor(const self_t&) = delete;
+    self_t& operator=(const self_t&)        = delete;
+
+    /** Move operations are deleted: the owned index_ stores a reference back to
+     * this adaptor object (passed as the dataset adaptor at construction), so
+     * moving would leave that reference dangling. Deleting them also prevents
+     * a double-free of the raw index_ pointer. */
+    KDTreeEigenMatrixAdaptor(self_t&&) = delete;
+    self_t& operator=(self_t&&)        = delete;
 
     ~KDTreeEigenMatrixAdaptor() { delete index_; }
 
