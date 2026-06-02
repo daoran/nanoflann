@@ -1200,11 +1200,15 @@ class KDTreeBaseClass
         // If this is a leaf node, then do check and return.
         if (!node->child1)  // (if one node is nullptr, both are)
         {
+            // Hoist the point length out of the per-point loop. For a
+            // fixed-size tree (DIM > 0) this is a compile-time constant; for a
+            // runtime dimension it avoids re-reading obj.dim_ on every point.
+            const Size dim = veclen(obj);
             for (Offset i = node->node_type.lr.left; i < node->node_type.lr.right; ++i)
             {
                 const IndexType accessor = vAcc_[i];
                 if (!obj.isActive(accessor)) continue;
-                DistanceType dist = obj.distance_.evalMetric(vec, accessor, veclen(obj));
+                DistanceType dist = obj.distance_.evalMetric(vec, accessor, dim);
                 if (dist < result_set.worstDist())
                 {
                     if (!result_set.addPoint(
@@ -1548,7 +1552,8 @@ class KDTreeBaseClass
         assert(vec);
         DistanceType dist = DistanceType();
 
-        for (Dimension i = 0; i < static_cast<Dimension>(veclen(obj)); ++i)
+        const Dimension dims = static_cast<Dimension>(veclen(obj));
+        for (Dimension i = 0; i < dims; ++i)
         {
             if (vec[i] < obj.root_bbox_[i].low)
             {
