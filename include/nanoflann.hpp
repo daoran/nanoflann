@@ -1104,10 +1104,21 @@ class KDTreeBaseClass
     PooledAllocator pool_;
 
     /** Returns number of points in dataset  */
-    Size size(const Derived& obj) const noexcept { return obj.size_; }
+    NANOFLANN_NODISCARD Size size(const Derived& obj) const noexcept { return obj.size_; }
 
-    /** Returns the length of each point in the dataset */
-    Size veclen(const Derived& obj) const noexcept { return DIM > 0 ? DIM : obj.dim_; }
+    /** Returns the length of each point in the dataset.
+     *  For a fixed-size tree (DIM > 0) this is a compile-time constant; under
+     *  C++17 the `if constexpr` lets the compiler drop the runtime read of
+     *  `dim_` entirely. The C++11 path keeps the equivalent ternary. */
+    NANOFLANN_NODISCARD Size veclen(const Derived& obj) const noexcept
+    {
+#if defined(__cpp_if_constexpr) && __cpp_if_constexpr >= 201606L
+        if constexpr (DIM > 0) { return DIM; }
+        else { return obj.dim_; }
+#else
+        return DIM > 0 ? DIM : obj.dim_;
+#endif
+    }
 
     /// Helper accessor to the dataset points:
     ElementType dataset_get(const Derived& obj, IndexType element, Dimension component) const
@@ -1119,7 +1130,7 @@ class KDTreeBaseClass
      * Computes the index memory usage
      * Returns: memory used by the index
      */
-    Size usedMemory(const Derived& obj) const
+    NANOFLANN_NODISCARD Size usedMemory(const Derived& obj) const
     {
         return obj.pool_.usedMemory + obj.pool_.wastedMemory +
                obj.dataset_.kdtree_get_point_count() *
@@ -1154,7 +1165,7 @@ class KDTreeBaseClass
     void computeBoundingBox(BoundingBox& bbox)
     {
         Derived&   obj  = static_cast<Derived&>(*this);
-        const auto dims = (DIM > 0 ? DIM : dim_);
+        const Dimension dims = static_cast<Dimension>(veclen(obj));
         resize(bbox, dims);
         if (obj.dataset_.kdtree_get_bbox(bbox)) return;
         if (!size_)
@@ -1193,7 +1204,7 @@ class KDTreeBaseClass
             {
                 const IndexType accessor = vAcc_[i];
                 if (!obj.isActive(accessor)) continue;
-                DistanceType dist = obj.distance_.evalMetric(vec, accessor, (DIM > 0 ? DIM : dim_));
+                DistanceType dist = obj.distance_.evalMetric(vec, accessor, veclen(obj));
                 if (dist < result_set.worstDist())
                 {
                     if (!result_set.addPoint(
@@ -1255,7 +1266,7 @@ class KDTreeBaseClass
         assert(static_cast<Size>(obj.vAcc_.at(left)) < obj.dataset_.kdtree_get_point_count());
 
         NodePtr    node = obj.pool_.template allocate<Node>();  // allocate memory
-        const auto dims = (DIM > 0 ? DIM : obj.dim_);
+        const Dimension dims = static_cast<Dimension>(veclen(obj));
 
         /* If too few exemplars remain, then make this a leaf node. */
         if ((right - left) <= static_cast<Offset>(obj.leaf_max_size_))
@@ -1333,7 +1344,7 @@ class KDTreeBaseClass
         NodePtr                      node = obj.pool_.template allocate<Node>();  // allocate memory
         lock.unlock();
 
-        const auto dims = (DIM > 0 ? DIM : obj.dim_);
+        const Dimension dims = static_cast<Dimension>(veclen(obj));
 
         /* If too few exemplars remain, then make this a leaf node. */
         if ((right - left) <= static_cast<Offset>(obj.leaf_max_size_))
@@ -1427,7 +1438,7 @@ class KDTreeBaseClass
         const Derived& obj, const Offset ind, const Size count, Offset& index, Dimension& cutfeat,
         DistanceType& cutval, const BoundingBox& bbox)
     {
-        const auto dims = (DIM > 0 ? DIM : obj.dim_);
+        const Dimension dims = static_cast<Dimension>(veclen(obj));
         const auto EPS  = static_cast<DistanceType>(0.00001);
 
         // Pre-compute max_span once
@@ -1547,7 +1558,7 @@ class KDTreeBaseClass
         assert(vec);
         DistanceType dist = DistanceType();
 
-        for (Dimension i = 0; i < (DIM > 0 ? DIM : obj.dim_); ++i)
+        for (Dimension i = 0; i < static_cast<Dimension>(veclen(obj)); ++i)
         {
             if (vec[i] < obj.root_bbox_[i].low)
             {
@@ -1946,7 +1957,7 @@ class KDTreeSingleIndexAdaptor
         distance_vector_t dists;
         // Fill it with zeros.
         auto zero = static_cast<typename RESULTSET::DistanceType>(0);
-        assign(dists, (DIM > 0 ? DIM : Base::dim_), zero);
+        assign(dists, this->veclen(*this), zero);
         DistanceType dist = this->computeInitialDistances(*this, vec, dists);
         this->searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
 
@@ -2125,7 +2136,7 @@ class KDTreeSingleIndexAdaptor
 
     bool contains(const BoundingBox& bbox, IndexType idx) const
     {
-        const auto dims = (DIM > 0 ? DIM : Base::dim_);
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
         for (Dimension i = 0; i < dims; ++i)
         {
             const auto point = this->dataset_.kdtree_get_pt(idx, i);
@@ -2353,7 +2364,7 @@ class KDTreeSingleIndexDynamicAdaptor_
         distance_vector_t dists;
         // Fill it with zeros.
         assign(
-            dists, (DIM > 0 ? DIM : Base::dim_),
+            dists, this->veclen(*this),
             static_cast<typename distance_vector_t::value_type>(0));
         DistanceType dist = this->computeInitialDistances(*this, vec, dists);
         this->searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
