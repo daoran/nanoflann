@@ -1163,7 +1163,7 @@ class KDTreeBaseClass
      */
     NodePtr divideTree(Derived& obj, const Offset left, const Offset right, BoundingBox& bbox)
     {
-        assert(obj.vAcc_.at(left) < obj.dataset_.kdtree_get_point_count());
+        assert(static_cast<Size>(obj.vAcc_.at(left)) < obj.dataset_.kdtree_get_point_count());
 
         NodePtr    node = obj.pool_.template allocate<Node>();  // allocate memory
         const auto dims = (DIM > 0 ? DIM : obj.dim_);
@@ -2679,7 +2679,7 @@ class KDTreeSingleIndexDynamicAdaptor
         const size_t num_initial_points = dataset_.kdtree_get_point_count();
         if (num_initial_points > 0)
         {
-            addPoints(0, num_initial_points - 1);
+            addPoints(0, static_cast<IndexType>(num_initial_points - 1));
         }
     }
 
@@ -2837,7 +2837,7 @@ struct KDTreeEigenMatrixAdaptor
                 "Data set dimensionality does not match the 'DIM' template "
                 "argument");
         index_ = new index_t(
-            dims, *this /* adaptor */,
+            static_cast<Dimension>(dims), *this /* adaptor */,
             nanoflann::KDTreeSingleIndexAdaptorParams(
                 leaf_max_size, nanoflann::KDTreeSingleIndexAdaptorFlags::None, n_thread_build));
     }
