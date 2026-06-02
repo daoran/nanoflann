@@ -233,6 +233,46 @@ struct ResultItem
     DistanceType second;  //!< Distance from sample to query point
 };
 
+namespace detail
+{
+/** Insert (dist, index) into a sorted result buffer (dists, indices) of the
+ *  given capacity, keeping ascending distance order.  Shared by KNNResultSet
+ *  and RKNNResultSet, which are otherwise byte-for-byte identical.
+ *  Always returns true (caller should continue searching). */
+template <typename DistanceType, typename IndexType, typename CountType>
+bool addPointToSortedResultSet(
+    DistanceType* dists, IndexType* indices, CountType& count, CountType capacity,
+    DistanceType dist, IndexType index)
+{
+    CountType i;
+    for (i = count; i > 0; --i)
+    {
+#ifdef NANOFLANN_FIRST_MATCH
+        if ((dists[i - 1] > dist) || ((dist == dists[i - 1]) && (indices[i - 1] > index)))
+        {
+#else
+        if (dists[i - 1] > dist)
+        {
+#endif
+            if (i < capacity)
+            {
+                dists[i]   = dists[i - 1];
+                indices[i] = indices[i - 1];
+            }
+        }
+        else
+            break;
+    }
+    if (i < capacity)
+    {
+        dists[i]   = dist;
+        indices[i] = index;
+    }
+    if (count < capacity) count++;
+    return true;
+}
+}  // namespace detail
+
 /** @addtogroup result_sets_grp Result set classes
  *  @{ */
 
@@ -275,36 +315,7 @@ class KNNResultSet
      */
     bool addPoint(DistanceType dist, IndexType index)
     {
-        CountType i;
-        for (i = count; i > 0; --i)
-        {
-            /** If defined and two points have the same distance, the one with
-             *  the lowest-index will be returned first. */
-#ifdef NANOFLANN_FIRST_MATCH
-            if ((dists[i - 1] > dist) || ((dist == dists[i - 1]) && (indices[i - 1] > index)))
-            {
-#else
-            if (dists[i - 1] > dist)
-            {
-#endif
-                if (i < capacity)
-                {
-                    dists[i]   = dists[i - 1];
-                    indices[i] = indices[i - 1];
-                }
-            }
-            else
-                break;
-        }
-        if (i < capacity)
-        {
-            dists[i]   = dist;
-            indices[i] = index;
-        }
-        if (count < capacity) count++;
-
-        // tell caller that the search shall continue
-        return true;
+        return detail::addPointToSortedResultSet(dists, indices, count, capacity, dist, index);
     }
 
     //! Returns the worst distance among found solutions if the search result is
@@ -366,36 +377,7 @@ class RKNNResultSet
      */
     bool addPoint(DistanceType dist, IndexType index)
     {
-        CountType i;
-        for (i = count; i > 0; --i)
-        {
-            /** If defined and two points have the same distance, the one with
-             *  the lowest-index will be returned first. */
-#ifdef NANOFLANN_FIRST_MATCH
-            if ((dists[i - 1] > dist) || ((dist == dists[i - 1]) && (indices[i - 1] > index)))
-            {
-#else
-            if (dists[i - 1] > dist)
-            {
-#endif
-                if (i < capacity)
-                {
-                    dists[i]   = dists[i - 1];
-                    indices[i] = indices[i - 1];
-                }
-            }
-            else
-                break;
-        }
-        if (i < capacity)
-        {
-            dists[i]   = dist;
-            indices[i] = index;
-        }
-        if (count < capacity) count++;
-
-        // tell caller that the search shall continue
-        return true;
+        return detail::addPointToSortedResultSet(dists, indices, count, capacity, dist, index);
     }
 
     //! Returns the worst distance among found solutions if the search result is
@@ -1152,6 +1134,107 @@ class KDTreeBaseClass
         }
     }
 
+    /** Returns true if the point at index idx should be visited during search.
+     *  The static adaptor always returns true; the dynamic adaptor overrides
+     *  this to skip tombstoned (removed) points. */
+    NANOFLANN_NODISCARD bool isActive(IndexType /*idx*/) const { return true; }
+
+    /** Computes the bounding box of the points currently in the index.
+     *  Uses size_ (set by buildIndex before this is called) so the result is
+     *  correct for both the static and dynamic adaptors. */
+    void computeBoundingBox(BoundingBox& bbox)
+    {
+        Derived& obj = static_cast<Derived&>(*this);
+        const auto dims = (DIM > 0 ? DIM : dim_);
+        resize(bbox, dims);
+        if (obj.dataset_.kdtree_get_bbox(bbox)) return;
+        if (!size_)
+            throw std::runtime_error(
+                "[nanoflann] computeBoundingBox() called but "
+                "no data points found.");
+        for (Dimension i = 0; i < dims; ++i)
+            bbox[i].low = bbox[i].high = dataset_get(obj, vAcc_[0], i);
+        for (Offset k = 1; k < size_; ++k)
+            for (Dimension i = 0; i < dims; ++i)
+            {
+                const auto val = dataset_get(obj, vAcc_[k], i);
+                if (val < bbox[i].low) bbox[i].low = val;
+                if (val > bbox[i].high) bbox[i].high = val;
+            }
+    }
+
+    /**
+     * Performs an exact search in the tree starting from a node.
+     * Uses the CRTP-dispatched isActive() hook to skip removed points (no-op
+     * in the static adaptor, checks treeIndex_ in the dynamic adaptor).
+     * \tparam RESULTSET Should be any ResultSet<DistanceType>
+     * \return true if the search should be continued, false if the results are
+     * sufficient
+     */
+    template <class RESULTSET>
+    bool searchLevel(
+        RESULTSET& result_set, const ElementType* vec, const NodePtr node, DistanceType mindist,
+        distance_vector_t& dists, const DistanceType epsError) const
+    {
+        const Derived& obj = static_cast<const Derived&>(*this);
+        // If this is a leaf node, then do check and return.
+        if (!node->child1)  // (if one node is nullptr, both are)
+        {
+            for (Offset i = node->node_type.lr.left; i < node->node_type.lr.right; ++i)
+            {
+                const IndexType accessor = vAcc_[i];
+                if (!obj.isActive(accessor)) continue;
+                DistanceType dist =
+                    obj.distance_.evalMetric(vec, accessor, (DIM > 0 ? DIM : dim_));
+                if (dist < result_set.worstDist())
+                {
+                    if (!result_set.addPoint(
+                            static_cast<typename RESULTSET::DistanceType>(dist),
+                            static_cast<typename RESULTSET::IndexType>(accessor)))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        /* Which child branch should be taken first? */
+        Dimension    idx   = node->node_type.sub.divfeat;
+        ElementType  val   = vec[idx];
+        DistanceType diff1 = val - node->node_type.sub.divlow;
+        DistanceType diff2 = val - node->node_type.sub.divhigh;
+
+        NodePtr      bestChild;
+        NodePtr      otherChild;
+        DistanceType cut_dist;
+        if ((diff1 + diff2) < 0)
+        {
+            bestChild  = node->child1;
+            otherChild = node->child2;
+            cut_dist   = obj.distance_.accum_dist(val, node->node_type.sub.divhigh, idx);
+        }
+        else
+        {
+            bestChild  = node->child2;
+            otherChild = node->child1;
+            cut_dist   = obj.distance_.accum_dist(val, node->node_type.sub.divlow, idx);
+        }
+
+        /* Call recursively to search next level down. */
+        if (!searchLevel(result_set, vec, bestChild, mindist, dists, epsError))
+            return false;
+
+        DistanceType dst = dists[idx];
+        mindist          = mindist + cut_dist - dst;
+        dists[idx]       = cut_dist;
+        if (mindist * epsError <= result_set.worstDist())
+        {
+            if (!searchLevel(result_set, vec, otherChild, mindist, dists, epsError))
+                return false;
+        }
+        dists[idx] = dst;
+        return true;
+    }
+
     /**
      * Create a tree node that subdivides the list of vecs from vind[first]
      * to vind[last].  The routine is called recursively on each sublist.
@@ -1803,7 +1886,7 @@ class KDTreeSingleIndexAdaptor
         this->freeIndex(*this);
         Base::size_at_index_build_ = Base::size_;
         if (Base::size_ == 0) return;
-        computeBoundingBox(Base::root_bbox_);
+        this->computeBoundingBox(Base::root_bbox_);
         // construct the tree
         if (Base::n_thread_build_ == 1)
         {
@@ -1859,7 +1942,7 @@ class KDTreeSingleIndexAdaptor
         auto zero = static_cast<typename RESULTSET::DistanceType>(0);
         assign(dists, (DIM > 0 ? DIM : Base::dim_), zero);
         DistanceType dist = this->computeInitialDistances(*this, vec, dists);
-        searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
+        this->searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
 
         if (searchParams.sorted) result.sort();
 
@@ -2034,37 +2117,6 @@ class KDTreeSingleIndexAdaptor
         for (IndexType i = 0; i < static_cast<IndexType>(Base::size_); i++) Base::vAcc_[i] = i;
     }
 
-    void computeBoundingBox(BoundingBox& bbox)
-    {
-        const auto dims = (DIM > 0 ? DIM : Base::dim_);
-        resize(bbox, dims);
-        if (dataset_.kdtree_get_bbox(bbox))
-        {
-            // Done! It was implemented in derived class
-        }
-        else
-        {
-            const Size N = dataset_.kdtree_get_point_count();
-            if (!N)
-                throw std::runtime_error(
-                    "[nanoflann] computeBoundingBox() called but "
-                    "no data points found.");
-            for (Dimension i = 0; i < dims; ++i)
-            {
-                bbox[i].low = bbox[i].high = this->dataset_get(*this, Base::vAcc_[0], i);
-            }
-            for (Offset k = 1; k < N; ++k)
-            {
-                for (Dimension i = 0; i < dims; ++i)
-                {
-                    const auto val = this->dataset_get(*this, Base::vAcc_[k], i);
-                    if (val < bbox[i].low) bbox[i].low = val;
-                    if (val > bbox[i].high) bbox[i].high = val;
-                }
-            }
-        }
-    }
-
     bool contains(const BoundingBox& bbox, IndexType idx) const
     {
         const auto dims = (DIM > 0 ? DIM : Base::dim_);
@@ -2073,84 +2125,6 @@ class KDTreeSingleIndexAdaptor
             const auto point = this->dataset_.kdtree_get_pt(idx, i);
             if (point < bbox[i].low || point > bbox[i].high) return false;
         }
-        return true;
-    }
-
-    /**
-     * Performs an exact search in the tree starting from a node.
-     * \tparam RESULTSET Should be any ResultSet<DistanceType>
-     * \return true if the search should be continued, false if the results are
-     * sufficient
-     */
-    template <class RESULTSET>
-    bool searchLevel(
-        RESULTSET& result_set, const ElementType* vec, const NodePtr node, DistanceType mindist,
-        distance_vector_t& dists, const DistanceType epsError) const
-    {
-        // If this is a leaf node, then do check and return.
-        if (!node->child1)  // (if one node is nullptr, both are)
-        {
-            for (Offset i = node->node_type.lr.left; i < node->node_type.lr.right; ++i)
-            {
-                const IndexType accessor = Base::vAcc_[i];  // reorder... : i;
-                DistanceType    dist =
-                    distance_.evalMetric(vec, accessor, (DIM > 0 ? DIM : Base::dim_));
-                if (dist < result_set.worstDist())
-                {
-                    if (!result_set.addPoint(dist, Base::vAcc_[i]))
-                    {
-                        // the resultset doesn't want to receive any more
-                        // points, we're done searching!
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        /* Which child branch should be taken first? */
-        Dimension    idx   = node->node_type.sub.divfeat;
-        ElementType  val   = vec[idx];
-        DistanceType diff1 = val - node->node_type.sub.divlow;
-        DistanceType diff2 = val - node->node_type.sub.divhigh;
-
-        NodePtr      bestChild;
-        NodePtr      otherChild;
-        DistanceType cut_dist;
-        if ((diff1 + diff2) < 0)
-        {
-            bestChild  = node->child1;
-            otherChild = node->child2;
-            cut_dist   = distance_.accum_dist(val, node->node_type.sub.divhigh, idx);
-        }
-        else
-        {
-            bestChild  = node->child2;
-            otherChild = node->child1;
-            cut_dist   = distance_.accum_dist(val, node->node_type.sub.divlow, idx);
-        }
-
-        /* Call recursively to search next level down. */
-        if (!searchLevel(result_set, vec, bestChild, mindist, dists, epsError))
-        {
-            // the resultset doesn't want to receive any more points, we're done
-            // searching!
-            return false;
-        }
-
-        DistanceType dst = dists[idx];
-        mindist          = mindist + cut_dist - dst;
-        dists[idx]       = cut_dist;
-        if (mindist * epsError <= result_set.worstDist())
-        {
-            if (!searchLevel(result_set, vec, otherChild, mindist, dists, epsError))
-            {
-                // the resultset doesn't want to receive any more points, we're
-                // done searching!
-                return false;
-            }
-        }
-        dists[idx] = dst;
         return true;
     }
 
@@ -2249,6 +2223,12 @@ class KDTreeSingleIndexDynamicAdaptor_
      * depending on "DIM" */
     using distance_vector_t = typename Base::distance_vector_t;
 
+    /** Returns false for points that have been removed (lazy deletion). */
+    NANOFLANN_NODISCARD bool isActive(IndexType idx) const
+    {
+        return treeIndex_[idx] != -1;
+    }
+
     /**
      * KDTree constructor
      *
@@ -2315,7 +2295,7 @@ class KDTreeSingleIndexDynamicAdaptor_
         this->freeIndex(*this);
         Base::size_at_index_build_ = Base::size_;
         if (Base::size_ == 0) return;
-        computeBoundingBox(Base::root_bbox_);
+        this->computeBoundingBox(Base::root_bbox_);
         // construct the tree
         if (Base::n_thread_build_ == 1)
         {
@@ -2373,7 +2353,7 @@ class KDTreeSingleIndexDynamicAdaptor_
             dists, (DIM > 0 ? DIM : Base::dim_),
             static_cast<typename distance_vector_t::value_type>(0));
         DistanceType dist = this->computeInitialDistances(*this, vec, dists);
-        searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
+        this->searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
 
         if (searchParams.sorted) result.sort();
 
@@ -2450,105 +2430,6 @@ class KDTreeSingleIndexDynamicAdaptor_
     /** @} */
 
    public:
-    void computeBoundingBox(BoundingBox& bbox)
-    {
-        const auto dims = (DIM > 0 ? DIM : Base::dim_);
-        resize(bbox, dims);
-
-        if (dataset_.kdtree_get_bbox(bbox))
-        {
-            // Done! It was implemented in derived class
-        }
-        else
-        {
-            const Size N = Base::size_;
-            if (!N)
-                throw std::runtime_error(
-                    "[nanoflann] computeBoundingBox() called but "
-                    "no data points found.");
-            for (Dimension i = 0; i < dims; ++i)
-            {
-                bbox[i].low = bbox[i].high = this->dataset_get(*this, Base::vAcc_[0], i);
-            }
-            for (Offset k = 1; k < N; ++k)
-            {
-                for (Dimension i = 0; i < dims; ++i)
-                {
-                    const auto val = this->dataset_get(*this, Base::vAcc_[k], i);
-                    if (val < bbox[i].low) bbox[i].low = val;
-                    if (val > bbox[i].high) bbox[i].high = val;
-                }
-            }
-        }
-    }
-
-    /**
-     * Performs an exact search in the tree starting from a node.
-     * \tparam RESULTSET Should be any ResultSet<DistanceType>
-     */
-    template <class RESULTSET>
-    void searchLevel(
-        RESULTSET& result_set, const ElementType* vec, const NodePtr node, DistanceType mindist,
-        distance_vector_t& dists, const DistanceType epsError) const
-    {
-        // If this is a leaf node, then do check and return.
-        if (!node->child1)  // (if one node is nullptr, both are)
-        {
-            for (Offset i = node->node_type.lr.left; i < node->node_type.lr.right; ++i)
-            {
-                const IndexType index = Base::vAcc_[i];  // reorder... : i;
-                if (treeIndex_[index] == -1) continue;
-                DistanceType dist = distance_.evalMetric(vec, index, (DIM > 0 ? DIM : Base::dim_));
-                if (dist < result_set.worstDist())
-                {
-                    if (!result_set.addPoint(
-                            static_cast<typename RESULTSET::DistanceType>(dist),
-                            static_cast<typename RESULTSET::IndexType>(Base::vAcc_[i])))
-                    {
-                        // the resultset doesn't want to receive any more
-                        // points, we're done searching!
-                        return;  // false;
-                    }
-                }
-            }
-            return;
-        }
-
-        /* Which child branch should be taken first? */
-        Dimension    idx   = node->node_type.sub.divfeat;
-        ElementType  val   = vec[idx];
-        DistanceType diff1 = val - node->node_type.sub.divlow;
-        DistanceType diff2 = val - node->node_type.sub.divhigh;
-
-        NodePtr      bestChild;
-        NodePtr      otherChild;
-        DistanceType cut_dist;
-        if ((diff1 + diff2) < 0)
-        {
-            bestChild  = node->child1;
-            otherChild = node->child2;
-            cut_dist   = distance_.accum_dist(val, node->node_type.sub.divhigh, idx);
-        }
-        else
-        {
-            bestChild  = node->child2;
-            otherChild = node->child1;
-            cut_dist   = distance_.accum_dist(val, node->node_type.sub.divlow, idx);
-        }
-
-        /* Call recursively to search next level down. */
-        searchLevel(result_set, vec, bestChild, mindist, dists, epsError);
-
-        DistanceType dst = dists[idx];
-        mindist          = mindist + cut_dist - dst;
-        dists[idx]       = cut_dist;
-        if (mindist * epsError <= result_set.worstDist())
-        {
-            searchLevel(result_set, vec, otherChild, mindist, dists, epsError);
-        }
-        dists[idx] = dst;
-    }
-
    public:
     /**  Stores the index in a binary file.
      *   IMPORTANT NOTE: The set of data points is NOT stored in the file, so
