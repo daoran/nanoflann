@@ -3,7 +3,7 @@
  *
  * Copyright 2008-2009  Marius Muja (mariusm@cs.ubc.ca). All rights reserved.
  * Copyright 2008-2009  David G. Lowe (lowe@cs.ubc.ca). All rights reserved.
- * Copyright 2011-2025  Jose Luis Blanco (joseluisblancoc@gmail.com).
+ * Copyright 2011-2026  Jose Luis Blanco (joseluisblancoc@gmail.com).
  *   All rights reserved.
  *
  * THE BSD LICENSE
@@ -1144,7 +1144,7 @@ class KDTreeBaseClass
      *  correct for both the static and dynamic adaptors. */
     void computeBoundingBox(BoundingBox& bbox)
     {
-        Derived& obj = static_cast<Derived&>(*this);
+        Derived&   obj  = static_cast<Derived&>(*this);
         const auto dims = (DIM > 0 ? DIM : dim_);
         resize(bbox, dims);
         if (obj.dataset_.kdtree_get_bbox(bbox)) return;
@@ -1184,8 +1184,7 @@ class KDTreeBaseClass
             {
                 const IndexType accessor = vAcc_[i];
                 if (!obj.isActive(accessor)) continue;
-                DistanceType dist =
-                    obj.distance_.evalMetric(vec, accessor, (DIM > 0 ? DIM : dim_));
+                DistanceType dist = obj.distance_.evalMetric(vec, accessor, (DIM > 0 ? DIM : dim_));
                 if (dist < result_set.worstDist())
                 {
                     if (!result_set.addPoint(
@@ -1220,16 +1219,14 @@ class KDTreeBaseClass
         }
 
         /* Call recursively to search next level down. */
-        if (!searchLevel(result_set, vec, bestChild, mindist, dists, epsError))
-            return false;
+        if (!searchLevel(result_set, vec, bestChild, mindist, dists, epsError)) return false;
 
         DistanceType dst = dists[idx];
         mindist          = mindist + cut_dist - dst;
         dists[idx]       = cut_dist;
         if (mindist * epsError <= result_set.worstDist())
         {
-            if (!searchLevel(result_set, vec, otherChild, mindist, dists, epsError))
-                return false;
+            if (!searchLevel(result_set, vec, otherChild, mindist, dists, epsError)) return false;
         }
         dists[idx] = dst;
         return true;
@@ -2224,10 +2221,7 @@ class KDTreeSingleIndexDynamicAdaptor_
     using distance_vector_t = typename Base::distance_vector_t;
 
     /** Returns false for points that have been removed (lazy deletion). */
-    NANOFLANN_NODISCARD bool isActive(IndexType idx) const
-    {
-        return treeIndex_[idx] != -1;
-    }
+    NANOFLANN_NODISCARD bool isActive(IndexType idx) const { return treeIndex_[idx] != -1; }
 
     /**
      * KDTree constructor
