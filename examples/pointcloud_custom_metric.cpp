@@ -76,7 +76,7 @@ struct My_Custom_Metric_Adaptor
     }
 };
 
-static void kdtree_custom_metric_demo(const size_t N)
+void kdtree_custom_metric_demo(const size_t N)
 {
     using num_t = double;
 

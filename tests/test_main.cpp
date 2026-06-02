@@ -144,7 +144,8 @@ void generateRandomPointCloud(
     for (size_t i = 0; i < N; i++)
     {
         samples[i].resize(dim);
-        for (size_t d = 0; d < dim; d++) samples[i][d] = max_range * (rand() % 1000) / NUM(1000.0);
+        for (size_t d = 0; d < dim; d++)
+            samples[i][d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
     }
 }
 
@@ -160,8 +161,7 @@ void L1_vs_bruteforce_test(const size_t nSamples, const size_t DIM, const size_t
 
     // Query point:
     std::vector<NUM> query_pt(DIM);
-    for (size_t d = 0; d < DIM; d++)
-        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+    for (size_t d = 0; d < DIM; d++) query_pt[d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
 
     // construct a kd-tree index:
     // Dimensionality set at run-time
@@ -236,8 +236,7 @@ void rknn_L1_vs_bruteforce_test(
 
     // Query point:
     std::vector<NUM> query_pt(DIM);
-    for (size_t d = 0; d < DIM; d++)
-        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+    for (size_t d = 0; d < DIM; d++) query_pt[d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
 
     // construct a kd-tree index:
     // Dimensionality set at run-time
@@ -317,8 +316,7 @@ void L2_vs_bruteforce_test(const size_t nSamples, const size_t DIM, const size_t
 
     // Query point:
     std::vector<NUM> query_pt(DIM);
-    for (size_t d = 0; d < DIM; d++)
-        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+    for (size_t d = 0; d < DIM; d++) query_pt[d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
 
     // construct a kd-tree index:
     // Dimensionality set at run-time (default: L2)
@@ -395,8 +393,8 @@ void box_L2_vs_bruteforce_test(const size_t nSamples, const size_t DIM)
     typename my_kd_tree_t::index_t::BoundingBox query_box(DIM);
     for (size_t d = 0; d < DIM; d++)
     {
-        query_box[d].low  = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
-        query_box[d].high = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+        query_box[d].low  = max_range * NUM(rand() % 1000) / NUM(1000.0);
+        query_box[d].high = max_range * NUM(rand() % 1000) / NUM(1000.0);
         if (query_box[d].low > query_box[d].high) std::swap(query_box[d].low, query_box[d].high);
     }
 
@@ -443,8 +441,7 @@ void rknn_L2_vs_bruteforce_test(
 
     // Query point:
     std::vector<NUM> query_pt(DIM);
-    for (size_t d = 0; d < DIM; d++)
-        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+    for (size_t d = 0; d < DIM; d++) query_pt[d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
 
     // construct a kd-tree index:
     // Dimensionality set at run-time (default: L2)
@@ -639,7 +636,7 @@ void L2_dynamic_vs_bruteforce_test(const size_t nSamples)
     for (size_t i = 0; i < nSamples / 2; i = i + chunk_size)
     {
         end = min(size_t(i + chunk_size), nSamples / 2 - 1);
-        index.addPoints(i, end);
+        index.addPoints(static_cast<uint32_t>(i), static_cast<uint32_t>(end));
     }
 
     {
@@ -678,7 +675,7 @@ void L2_dynamic_vs_bruteforce_test(const size_t nSamples)
     for (size_t i = end + 1; i < nSamples; i = i + chunk_size)
     {
         end = min(size_t(i + chunk_size), nSamples - 1);
-        index.addPoints(i, end);
+        index.addPoints(static_cast<uint32_t>(i), static_cast<uint32_t>(end));
     }
 
     {
@@ -728,8 +725,7 @@ void L2_concurrent_build_vs_bruteforce_test(const size_t nSamples, const size_t 
 
     // Query point:
     std::vector<NUM> query_pt(DIM);
-    for (size_t d = 0; d < DIM; d++)
-        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+    for (size_t d = 0; d < DIM; d++) query_pt[d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
 
     // construct a kd-tree index:
     // Dimensionality set at run-time (default: L2)
@@ -783,8 +779,7 @@ void L2_concurrent_build_vs_L2_test(const size_t nSamples, const size_t DIM)
 
     // Query point:
     std::vector<NUM> query_pt(DIM);
-    for (size_t d = 0; d < DIM; d++)
-        query_pt[d] = static_cast<NUM>(max_range * (rand() % 1000) / (1000.0));
+    for (size_t d = 0; d < DIM; d++) query_pt[d] = max_range * NUM(rand() % 1000) / NUM(1000.0);
 
     // construct a kd-tree index:
     // Dimensionality set at run-time (default: L2)
@@ -875,15 +870,16 @@ TEST(kdtree, L1_vs_bruteforce)
 TEST(kdtree, L1_vs_bruteforce_rknn)
 {
     srand(static_cast<unsigned int>(time(nullptr)));
-    for (int knn = 1; knn < 20; knn += 3)
+    for (size_t knn = 1; knn < 20; knn += 3)
     {
         for (int r = 1; r < 5; r++)
         {
+            const float rf = static_cast<float>(r);
             for (int i = 0; i < 100; i++)
             {
-                rknn_L1_vs_bruteforce_test<float>(100, 2, knn, 9.0f * r * r);
-                rknn_L1_vs_bruteforce_test<float>(100, 3, knn, 9.0f * r * r);
-                rknn_L1_vs_bruteforce_test<float>(100, 7, knn, 9.0f * r * r);
+                rknn_L1_vs_bruteforce_test<float>(100, 2, knn, 9.0f * rf * rf);
+                rknn_L1_vs_bruteforce_test<float>(100, 3, knn, 9.0f * rf * rf);
+                rknn_L1_vs_bruteforce_test<float>(100, 7, knn, 9.0f * rf * rf);
 
                 rknn_L1_vs_bruteforce_test<double>(100, 2, knn, 9.0 * r * r);
                 rknn_L1_vs_bruteforce_test<double>(100, 3, knn, 9.0 * r * r);
@@ -971,15 +967,16 @@ TEST(kdtree, box_L2_vs_bruteforce)
 TEST(kdtree, L2_vs_bruteforce_rknn)
 {
     srand(static_cast<unsigned int>(time(nullptr)));
-    for (int knn = 1; knn < 20; knn += 3)
+    for (size_t knn = 1; knn < 20; knn += 3)
     {
         for (int r = 1; r < 5; r++)
         {
+            const float rf = static_cast<float>(r);
             for (int i = 0; i < 100; i++)
             {
-                rknn_L2_vs_bruteforce_test<float>(100, 2, knn, 9.0f * r * r);
-                rknn_L2_vs_bruteforce_test<float>(100, 3, knn, 9.0f * r * r);
-                rknn_L2_vs_bruteforce_test<float>(100, 7, knn, 9.0f * r * r);
+                rknn_L2_vs_bruteforce_test<float>(100, 2, knn, 9.0f * rf * rf);
+                rknn_L2_vs_bruteforce_test<float>(100, 3, knn, 9.0f * rf * rf);
+                rknn_L2_vs_bruteforce_test<float>(100, 7, knn, 9.0f * rf * rf);
 
                 rknn_L2_vs_bruteforce_test<double>(100, 2, knn, 9.0 * r * r);
                 rknn_L2_vs_bruteforce_test<double>(100, 3, knn, 9.0 * r * r);
@@ -1154,7 +1151,7 @@ TEST(kdtree, dynamic_repeated_remove_readd)
         // Re-add the removed points
         for (size_t i = 0; i < N / 2; i++)
         {
-            index.addPoints(i, i);
+            index.addPoints(static_cast<uint32_t>(i), static_cast<uint32_t>(i));
         }
 
         // Query again - nearest should be index 5 (closest to query point)
@@ -1203,7 +1200,8 @@ TEST(kdtree, dynamic_readd_no_duplicates)
     for (size_t iteration = 0; iteration < 10; iteration++)
     {
         for (size_t i = 0; i < N / 2; i++) index.removePoint(i);
-        for (size_t i = 0; i < N / 2; i++) index.addPoints(i, i);
+        for (size_t i = 0; i < N / 2; i++)
+            index.addPoints(static_cast<uint32_t>(i), static_cast<uint32_t>(i));
     }
 
     // The number of stored entries must not have grown: re-adding a removed

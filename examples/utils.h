@@ -80,9 +80,9 @@ void generateRandomPointCloudRanges(
     pc.pts.resize(N);
     for (size_t i = 0; i < N; i++)
     {
-        pc.pts[i].x = max_range_x * (rand() % 1000) / T(1000);
-        pc.pts[i].y = max_range_y * (rand() % 1000) / T(1000);
-        pc.pts[i].z = max_range_z * (rand() % 1000) / T(1000);
+        pc.pts[i].x = max_range_x * T(rand() % 1000) / T(1000);
+        pc.pts[i].y = max_range_y * T(rand() % 1000) / T(1000);
+        pc.pts[i].z = max_range_z * T(rand() % 1000) / T(1000);
     }
 }
 
@@ -147,12 +147,12 @@ void generateRandomPointCloud_Quat(PointCloud_Quat<T>& point, const size_t N)
         X   = static_cast<T>(2 * (((double)rand()) / RAND_MAX) - 1);
         Y   = static_cast<T>(2 * (((double)rand()) / RAND_MAX) - 1);
         Z   = static_cast<T>(2 * (((double)rand()) / RAND_MAX) - 1);
-        mag = sqrt(X * X + Y * Y + Z * Z);
+        mag = static_cast<T>(sqrt(X * X + Y * Y + Z * Z));
         X /= mag;
         Y /= mag;
         Z /= mag;
-        cosAng         = cos(theta / 2);
-        sinAng         = sin(theta / 2);
+        cosAng         = static_cast<T>(cos(theta / 2));
+        sinAng         = static_cast<T>(sin(theta / 2));
         point.pts[i].w = cosAng;
         point.pts[i].x = X * sinAng;
         point.pts[i].y = Y * sinAng;

@@ -61,7 +61,7 @@ void kdtree_demo(const size_t N)
     {
         size_t end = std::min<size_t>(i + chunk_size, N - 1);
         // Inserts all points from [i, end]
-        index.addPoints(i, end);
+        index.addPoints(static_cast<uint32_t>(i), static_cast<uint32_t>(end));
     }
 
     // remove a point
