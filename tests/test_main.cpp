@@ -608,8 +608,16 @@ void SO2_vs_bruteforce_test(const size_t nSamples)
         }
         ASSERT_TRUE(min_idx != std::numeric_limits<size_t>::max());
     }
-    // Compare:
-    EXPECT_EQ(min_idx, ret_indexes[0]);
+    // Compare: the kd-tree must return *a* nearest neighbour, i.e. one whose
+    // angular distance equals the brute-force minimum. We must not require the
+    // index to match min_idx exactly: when two points are (nearly) equidistant
+    // from the query, the brute-force loop keeps the lowest index while the
+    // kd-tree may return any of the tied points, so an index comparison is
+    // ill-defined under ties.
+    SO2_Adaptor<NUM, PointCloud_Orient<NUM>> so2(cloud);
+    const double                             ret_dist =
+        so2.accum_dist(query_pt[0], cloud.kdtree_get_pt(ret_indexes[0], 0), 0);
+    EXPECT_NEAR(min_dist_SO2, ret_dist, 1e-4);
     EXPECT_NEAR(min_dist_SO2, out_dists_sqr[0], 1e-3);
 }
 
