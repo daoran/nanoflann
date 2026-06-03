@@ -74,10 +74,14 @@
 #include <functional>  // std::reference_wrapper
 #include <future>
 #include <istream>
+#include <chrono>  // std::chrono (async incremental index polling)
 #include <limits>  // std::numeric_limits
+#include <memory>  // std::unique_ptr (async incremental index)
+#include <new>  // placement new (incremental index node pool)
 #include <ostream>
 #include <stack>
 #include <stdexcept>
+#include <type_traits>  // std::is_trivially_destructible
 #include <unordered_map>
 #include <vector>
 
@@ -451,6 +455,40 @@ class RadiusResultSet
     }
 
     void sort() { std::sort(m_indices_dists.begin(), m_indices_dists.end(), IndexDist_Sorter()); }
+};
+
+/**
+ * A result-set class used when collecting all points contained within an
+ * axis-aligned bounding box (see findWithinBox()). Distances are not used;
+ * matching point indices are appended to the user-provided vector.
+ */
+template <typename _IndexType = size_t>
+class BoxResultSet
+{
+   public:
+    using IndexType = _IndexType;
+
+    std::vector<IndexType>& m_indices;
+
+    explicit BoxResultSet(std::vector<IndexType>& indices) : m_indices(indices)
+    {
+        m_indices.clear();
+    }
+
+    NANOFLANN_NODISCARD size_t size() const noexcept { return m_indices.size(); }
+    NANOFLANN_NODISCARD bool   empty() const noexcept { return m_indices.empty(); }
+    NANOFLANN_NODISCARD bool   full() const noexcept { return true; }
+
+    /** Called for each point found inside the query box. The distance argument
+     *  is unused (always 0 for a box query). @return always true (keep going). */
+    template <typename DistanceType>
+    bool addPoint(DistanceType /*dist*/, IndexType index)
+    {
+        m_indices.push_back(index);
+        return true;
+    }
+
+    void sort() { std::sort(m_indices.begin(), m_indices.end()); }
 };
 
 /** @} */
@@ -2664,6 +2702,1248 @@ class KDTreeSingleIndexDynamicAdaptor
         return result.full();
     }
 };
+
+/** Parameters for KDTreeSingleIndexIncrementalAdaptor.
+ *
+ * The two \a alpha_* thresholds drive the weight-balanced (scapegoat-style)
+ * partial rebuilds:
+ *  - \a alpha_balance : a subtree is rebuilt when the larger of its two child
+ *    subtrees holds more than this fraction of the subtree's points. Lower
+ *    values keep the tree better balanced (faster queries) at the price of more
+ *    frequent rebuilds. Typical range [0.55, 0.85].
+ *  - \a alpha_deleted : a subtree is rebuilt (physically dropping tombstoned
+ *    points) when the fraction of removed points in it exceeds this value. Lower
+ *    values reclaim memory more aggressively. Typical range [0.3, 0.7].
+ */
+struct KDTreeIncrementalIndexParams
+{
+    KDTreeIncrementalIndexParams(float alpha_balance_ = 0.75f, float alpha_deleted_ = 0.5f)
+        : alpha_balance(alpha_balance_), alpha_deleted(alpha_deleted_)
+    {
+    }
+
+    float alpha_balance;
+    float alpha_deleted;
+};
+
+/** kd-tree incremental dynamic index — a single, self-balancing k-d tree.
+ *
+ * This is an additive alternative to KDTreeSingleIndexDynamicAdaptor (the
+ * "logarithmic forest"). Instead of maintaining O(log N) static sub-trees, it
+ * keeps a *single* weight-balanced k-d tree that supports cheap incremental
+ * point insertion, lazy point removal, and pruned axis-aligned box deletions
+ * (removeBox / removeOutsideBox), the latter being the primary map-maintenance
+ * primitive used in LiDAR odometry (keep a local cube around the sensor and
+ * discard everything outside it as the platform moves).
+ *
+ * Compared with the forest, the single tree avoids the multiplicative
+ * O(log N) query penalty of querying every sub-tree, and keeps deletion garbage
+ * bounded (a subtree is rebuilt once its dead fraction crosses
+ * `alpha_deleted`), at the price of synchronous O(N) rebuild spikes near the
+ * root.
+ *
+ * Like the other adaptors this is zero-copy: the data points live in the
+ * user-provided dataset; the tree only stores point indices. Each tree node
+ * holds a single point plus augmentation (subtree size, tombstone count and an
+ * axis-aligned bounding box) used to prune the box-region operations.
+ *
+ * \note Threading: like the rest of nanoflann, const queries are safe for
+ *       concurrent readers, but mutating operations (addPoints / removePoint /
+ *       removeBox / removeOutsideBox) must not run concurrently with any query.
+ *
+ * \note A compile-time fixed \a DIM (e.g. 3 for 3D LiDAR) is recommended: the
+ *       per-node bounding box is then a stack std::array and no per-node heap
+ *       allocation occurs. With DIM=-1 each node's box is a std::vector.
+ *
+ * \tparam Distance The distance metric (nanoflann::metric_L2_Simple, etc).
+ * \tparam DatasetAdaptor The user-provided dataset adaptor.
+ * \tparam DIM Dimensionality of the data points (e.g. 3), or -1 for runtime.
+ * \tparam IndexType Type used to index data points (e.g. uint32_t).
+ */
+template <typename Distance, class DatasetAdaptor, int32_t DIM = -1, typename IndexType = uint32_t>
+class KDTreeSingleIndexIncrementalAdaptor
+    : public KDTreeBaseClass<
+          KDTreeSingleIndexIncrementalAdaptor<Distance, DatasetAdaptor, DIM, IndexType>, Distance,
+          DatasetAdaptor, DIM, IndexType>
+{
+   public:
+    using Base = typename nanoflann::KDTreeBaseClass<
+        KDTreeSingleIndexIncrementalAdaptor<Distance, DatasetAdaptor, DIM, IndexType>, Distance,
+        DatasetAdaptor, DIM, IndexType>;
+
+    using ElementType  = typename Base::ElementType;
+    using DistanceType = typename Base::DistanceType;
+
+    using Offset    = typename Base::Offset;
+    using Size      = typename Base::Size;
+    using Dimension = typename Base::Dimension;
+
+    using Interval          = typename Base::Interval;
+    using BoundingBox       = typename Base::BoundingBox;
+    using distance_vector_t = typename Base::distance_vector_t;
+
+    /** The data source used by this index. */
+    const DatasetAdaptor& dataset_;
+
+    Distance distance_;
+
+    /** Augmented tree node: stores a single data point plus the maintenance
+     *  metadata. Children pointers are nullptr at the leaves. */
+    struct INode
+    {
+        IndexType ptIdx        = 0;  //!< index of the stored data point
+        Dimension divfeat      = 0;  //!< splitting axis at this node
+        bool      deleted      = false;  //!< this node's point is tombstoned
+        bool      treeDeleted  = false;  //!< whole subtree lazily tombstoned
+        INode*    child1       = nullptr;  //!< "< split" child (also free-list link)
+        INode*    child2       = nullptr;  //!< ">= split" child
+        INode*    parent       = nullptr;  //!< parent (nullptr at the root)
+        Size      subtree_size = 0;  //!< number of nodes in this subtree
+        Size      invalid_count = 0;  //!< number of tombstoned nodes in subtree
+        BoundingBox box;  //!< AABB of all points (live+dead) in this subtree
+        //! Cache of this node's own point coordinates, kept in-node to avoid the
+        //! dataset_get() indirection on the hot query / insert / box paths. Only
+        //! populated for a compile-time fixed DIM (`kCacheCoords`); for DIM=-1 it
+        //! stays an empty vector and the code falls back to the dataset.
+        typename array_or_vector<DIM, ElementType>::type pcoord;
+    };
+
+    /** Whether per-node coordinate caching is active: only for a compile-time
+     *  fixed DIM, so the cache is a stack array and adds no per-node heap.
+     *  Define NANOFLANN_INCREMENTAL_NO_COORD_CACHE to opt out (e.g. a very large
+     *  ElementType) and always read coordinates from the dataset. */
+#if defined(NANOFLANN_INCREMENTAL_NO_COORD_CACHE)
+    static constexpr bool kCacheCoords = false;
+#else
+    static constexpr bool kCacheCoords = (DIM > 0);
+#endif
+
+   private:
+    INode* iroot_    = nullptr;  //!< root of the incremental tree
+    INode* freeList_ = nullptr;  //!< recycled nodes (linked via child1)
+
+    Size liveCount_  = 0;  //!< number of live (non-tombstoned) points
+    Size totalCount_ = 0;  //!< number of nodes physically in the tree
+
+    float alphaBal_ = 0.75f;
+    float alphaDel_ = 0.5f;
+    /// Subtrees smaller than this are never rebuilt for *balance* reasons.
+    static constexpr Size kMinBalanceRebuild = 4;
+    /// addPoints() bulk-builds instead of inserting point-by-point when the
+    /// batch is at least this fraction of the current live count (see addPoints).
+    static constexpr double kBulkInsertFraction = 0.5;
+
+    /// Highest unbalanced node found during the current insertion (rebuilt once).
+    INode* pendingRebuild_ = nullptr;
+
+    /// When false, the index never performs inline (synchronous) balance or
+    /// deletion rebuilds: it only appends / lazily tombstones, and balance is
+    /// restored externally by full bulk rebuilds. Used by the multi-threaded
+    /// wrapper, which offloads the expensive rebuilds to a background thread.
+    bool inlineRebuild_ = true;
+
+    /// idx -> node holding that point (nullptr if the point is not present).
+    std::vector<INode*> nodeOfPoint_;
+
+    /// Scratch buffer reused across rebuilds (live indices being re-balanced).
+    std::vector<IndexType> buildBuf_;
+
+    /// Optional sink for physically-evicted point indices (acquireRemovedPoints).
+    bool                   collectRemoved_ = false;
+    std::vector<IndexType> removedSink_;
+
+   public:
+    /** Constructor.
+     * @param dimensionality Runtime dimensionality (ignored if DIM>0).
+     * @param inputData Dataset adaptor; its lifetime must outlive this index.
+     * @param params Balancing thresholds (see KDTreeIncrementalIndexParams).
+     *
+     * The tree starts empty regardless of the dataset size; call addPoints()
+     * to insert points (their indices must be valid in \a inputData).
+     */
+    explicit KDTreeSingleIndexIncrementalAdaptor(
+        const Dimension dimensionality, const DatasetAdaptor& inputData,
+        const KDTreeIncrementalIndexParams& params = {})
+        : dataset_(inputData), distance_(inputData)
+    {
+        Base::dim_ = dimensionality;
+        if (DIM > 0) Base::dim_ = DIM;
+        alphaBal_ = params.alpha_balance;
+        alphaDel_ = params.alpha_deleted;
+        resize(Base::root_bbox_, static_cast<Dimension>(this->veclen(*this)));
+    }
+
+    /** Deleted copy constructor (owns raw node memory). */
+    KDTreeSingleIndexIncrementalAdaptor(const KDTreeSingleIndexIncrementalAdaptor&) = delete;
+    KDTreeSingleIndexIncrementalAdaptor& operator=(const KDTreeSingleIndexIncrementalAdaptor&) =
+        delete;
+
+    ~KDTreeSingleIndexIncrementalAdaptor() { destroyNodeObjects(); }
+
+    /** \name Modifiers
+     * @{ */
+
+    /** Insert a single point (by its index in the dataset). */
+    void addPoint(IndexType idx)
+    {
+        ensureNodeMap(idx);
+        insertOne(idx);
+        syncRootBox();
+    }
+
+    /** Insert all points with indices in the inclusive range [start, end].
+     *
+     *  When the batch is large relative to the current tree (an empty tree, or
+     *  a batch comparable to the live count — e.g. a full LiDAR scan rebuilding
+     *  a heavily-trimmed map) it is cheaper to flatten the live points and
+     *  bulk-build one balanced tree than to descend-insert each point and
+     *  trigger near-root scapegoat rebuilds. Small batches relative to a large
+     *  map take the incremental per-point path. */
+    void addPoints(IndexType start, IndexType end)
+    {
+        if (end < start) return;
+        ensureNodeMap(end);
+        const Size batch = static_cast<Size>(end - start) + 1;
+        if (!iroot_ ||
+            static_cast<double>(batch) >= kBulkInsertFraction * static_cast<double>(liveCount_))
+        {
+            buildBuf_.clear();
+            if (iroot_) collectLiveAndFree(iroot_, buildBuf_);  // keep existing live points
+            for (IndexType idx = start; idx <= end; ++idx) buildBuf_.push_back(idx);
+            iroot_      = buildBalanced(buildBuf_, 0, buildBuf_.size(), 0, nullptr);
+            liveCount_  = buildBuf_.size();
+            totalCount_ = liveCount_;
+        }
+        else
+        {
+            for (IndexType idx = start; idx <= end; ++idx) insertOne(idx);
+        }
+        syncRootBox();
+    }
+
+    /** Lazily remove the point with the given index (no-op if absent/removed). */
+    void removePoint(IndexType idx)
+    {
+        if (idx >= nodeOfPoint_.size()) return;
+        INode* n = nodeOfPoint_[idx];
+        if (!n || n->deleted) return;
+        // A point can also be logically dead via a treeDeleted ancestor (a
+        // lazily-killed box region). Detect that and treat it as already gone.
+        for (INode* p = n->parent; p; p = p->parent)
+            if (p->treeDeleted) return;
+
+        n->deleted = true;
+        for (INode* p = n; p; p = p->parent) ++p->invalid_count;
+        --liveCount_;
+        maybeRebuildForDeletion();
+        syncRootBox();
+    }
+
+    /** Remove every live point lying inside the axis-aligned box \a box. */
+    void removeBox(const BoundingBox& box)
+    {
+        if (iroot_) removeBoxRec(iroot_, box);
+        maybeRebuildForDeletion();
+        syncRootBox();
+    }
+
+    /** Remove every live point lying *outside* the axis-aligned box \a keep.
+     *  This is the LiDAR sliding-window map-trimming primitive. */
+    void removeOutsideBox(const BoundingBox& keep)
+    {
+        if (iroot_) removeOutsideBoxRec(iroot_, keep);
+        maybeRebuildForDeletion();
+        syncRootBox();
+    }
+
+    /** Enable/disable recording of physically-evicted point indices, returned
+     *  by acquireRemovedPoints(). Off by default (cost-free when unused). */
+    void setCollectRemovedPoints(bool enable)
+    {
+        collectRemoved_ = enable;
+        if (!enable) std::vector<IndexType>().swap(removedSink_);
+    }
+
+    /** Move out the list of point indices physically dropped (during rebuilds)
+     *  since the last call. Requires setCollectRemovedPoints(true). */
+    std::vector<IndexType> acquireRemovedPoints()
+    {
+        std::vector<IndexType> out;
+        out.swap(removedSink_);
+        return out;
+    }
+
+    /** Enable/disable inline (synchronous) rebalancing. When disabled the index
+     *  only appends and lazily tombstones; balance must be restored externally
+     *  via buildFromIndices(). Used by the multi-threaded wrapper. */
+    void setInlineRebuild(bool enable) { inlineRebuild_ = enable; }
+
+    /** Append the live point indices (DFS, skipping tombstones) into \a out.
+     *  Non-destructive; used to snapshot the tree for a background rebuild. */
+    void snapshotLiveIndices(std::vector<IndexType>& out) const
+    {
+        snapshotRec(iroot_, out);
+    }
+
+    /** Append EVERY physically-stored point index (live and tombstoned) into
+     *  \a out. Used by the multi-threaded wrapper to detect which dataset slots
+     *  become free after a background rebuild swap. */
+    void collectPhysicalIndices(std::vector<IndexType>& out) const
+    {
+        collectAllRec(iroot_, out);
+    }
+
+    /** True if some tree node currently references the given point index (i.e.
+     *  the dataset slot is in use and must not be recycled). */
+    NANOFLANN_NODISCARD bool referencesIndex(IndexType idx) const
+    {
+        return idx < nodeOfPoint_.size() && nodeOfPoint_[idx] != nullptr;
+    }
+
+    /** Discard the current tree and bulk-build a fresh, balanced tree over the
+     *  given point indices. O(M log M). Reuses recycled nodes via the pool. */
+    void buildFromIndices(const std::vector<IndexType>& idxs)
+    {
+        if (iroot_)
+        {
+            buildBuf_.clear();
+            collectLiveAndFree(iroot_, buildBuf_);  // recycle existing nodes
+            iroot_ = nullptr;
+        }
+        IndexType maxIdx = 0;
+        for (IndexType v : idxs) maxIdx = std::max(maxIdx, v);
+        if (!idxs.empty()) ensureNodeMap(maxIdx);
+        buildBuf_.assign(idxs.begin(), idxs.end());
+        iroot_      = buildBalanced(buildBuf_, 0, buildBuf_.size(), 0, nullptr);
+        liveCount_  = buildBuf_.size();
+        totalCount_ = liveCount_;
+        syncRootBox();
+    }
+
+    /** @} */
+
+    /** \name Capacity / observers
+     * @{ */
+
+    /** Number of live (non-removed) points currently in the index. */
+    NANOFLANN_NODISCARD Size size() const noexcept { return liveCount_; }
+    NANOFLANN_NODISCARD bool empty() const noexcept { return liveCount_ == 0; }
+
+    /** Number of nodes physically stored (live + not-yet-reclaimed tombstones). */
+    NANOFLANN_NODISCARD Size physicalSize() const noexcept { return totalCount_; }
+
+    /** Approximate bytes used by the node pool and the index->node map. */
+    NANOFLANN_NODISCARD Size usedMemory() const
+    {
+        return Base::pool_.usedMemory + Base::pool_.wastedMemory +
+               nodeOfPoint_.capacity() * sizeof(INode*);
+    }
+
+    /** Axis-aligned bounding box of all points currently in the index (live and
+     *  not-yet-reclaimed tombstones — a conservative superset of the live set).
+     *  O(1): returns the cached root box. Meaningless if empty() (all zeros). */
+    NANOFLANN_NODISCARD BoundingBox boundingBox() const { return Base::root_bbox_; }
+
+    /** Pre-size the internal index->node map (and the rebuild scratch buffer) to
+     *  avoid reallocations while the point count grows toward \a n. */
+    void reserve(Size n)
+    {
+        nodeOfPoint_.reserve(n);
+        buildBuf_.reserve(n);
+    }
+
+    /** @} */
+
+    /** \name Query methods
+     * @{ */
+
+    /** Core search: find neighbors of \a vec, storing them in \a result. */
+    template <typename RESULTSET>
+    bool findNeighbors(
+        RESULTSET& result, const ElementType* vec, const SearchParameters& searchParams = {}) const
+    {
+        assert(vec);
+        if (!iroot_ || liveCount_ == 0) return false;
+        const DistanceType epsError = 1 + static_cast<DistanceType>(searchParams.eps);
+
+        distance_vector_t dists;
+        assign(
+            dists, this->veclen(*this),
+            static_cast<typename distance_vector_t::value_type>(0));
+        const DistanceType dist = this->computeInitialDistances(*this, vec, dists);
+        searchLevelInc(
+            result, vec, iroot_, dist, dists, epsError, this->veclen(*this));
+        if (searchParams.sorted) result.sort();
+        return result.full();
+    }
+
+    /** Find the \a num_closest nearest neighbors to \a query_point. */
+    NANOFLANN_NODISCARD Size knnSearch(
+        const ElementType* query_point, const Size num_closest, IndexType* out_indices,
+        DistanceType* out_distances, const SearchParameters& searchParams = {}) const
+    {
+        nanoflann::KNNResultSet<DistanceType, IndexType> resultSet(num_closest);
+        resultSet.init(out_indices, out_distances);
+        findNeighbors(resultSet, query_point, searchParams);
+        return resultSet.size();
+    }
+
+    /** Radius search around \a query_point. */
+    NANOFLANN_NODISCARD Size radiusSearch(
+        const ElementType* query_point, const DistanceType& radius,
+        std::vector<ResultItem<IndexType, DistanceType>>& IndicesDists,
+        const SearchParameters&                           searchParams = {}) const
+    {
+        RadiusResultSet<DistanceType, IndexType> resultSet(radius, IndicesDists);
+        findNeighbors(resultSet, query_point, searchParams);
+        return resultSet.size();
+    }
+
+    /** Custom-callback radius search. */
+    template <class SEARCH_CALLBACK>
+    NANOFLANN_NODISCARD Size radiusSearchCustomCallback(
+        const ElementType* query_point, SEARCH_CALLBACK& resultSet,
+        const SearchParameters& searchParams = {}) const
+    {
+        findNeighbors(resultSet, query_point, searchParams);
+        return resultSet.size();
+    }
+
+    /** Radius-limited KNN around \a query_point. */
+    NANOFLANN_NODISCARD Size rknnSearch(
+        const ElementType* query_point, const Size num_closest, IndexType* out_indices,
+        DistanceType* out_distances, const DistanceType& radius) const
+    {
+        nanoflann::RKNNResultSet<DistanceType, IndexType> resultSet(num_closest, radius);
+        resultSet.init(out_indices, out_distances);
+        findNeighbors(resultSet, query_point);
+        return resultSet.size();
+    }
+
+    /** Find all live points contained within the box \a bbox. */
+    template <typename RESULTSET>
+    NANOFLANN_NODISCARD Size findWithinBox(RESULTSET& result, const BoundingBox& bbox) const
+    {
+        if (iroot_) findWithinBoxRec(result, iroot_, bbox);
+        return result.size();
+    }
+
+    /** @} */
+
+   private:
+    // --------------------------------------------------------------------
+    //  Node allocation (bump-allocate from the pool, recycle via free-list)
+    // --------------------------------------------------------------------
+    INode* allocNode()
+    {
+        if (freeList_)
+        {
+            INode* n = freeList_;
+            freeList_ = n->child1;
+            return n;  // already constructed; box storage reused
+        }
+        INode* n = Base::pool_.template allocate<INode>();
+        // Placement-new so that, for DIM=-1, the std::vector box is constructed.
+        ::new (static_cast<void*>(n)) INode();
+        resize(n->box, static_cast<Dimension>(this->veclen(*this)));
+        if (kCacheCoords) resize(n->pcoord, static_cast<Dimension>(this->veclen(*this)));
+        return n;
+    }
+
+    /** Fill the node's cached coordinates from the dataset (fixed DIM only). */
+    void cacheCoords(INode* n)
+    {
+        if (!kCacheCoords) return;
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i) n->pcoord[i] = pt(n->ptIdx, i);
+    }
+
+    /** Coordinate of a node's own point along axis \a d (cached for fixed DIM). */
+    ElementType nodeCoord(const INode* n, Dimension d) const
+    {
+        return kCacheCoords ? n->pcoord[d] : pt(n->ptIdx, d);
+    }
+
+    /** Whether a node's own point lies inside box \a b (uses the coord cache). */
+    bool nodeInBox(const INode* n, const BoundingBox& b) const
+    {
+        if (!kCacheCoords) return pointInBox(n->ptIdx, b);
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+            if (n->pcoord[i] < b[i].low || n->pcoord[i] > b[i].high) return false;
+        return true;
+    }
+
+    void recycleNode(INode* n)
+    {
+        n->child1 = freeList_;
+        freeList_ = n;
+    }
+
+    /** Destroy all constructed INode objects (only needed when the box type is
+     *  not trivially destructible, i.e. DIM=-1 where it owns a std::vector). */
+    void destroyNodeObjects()
+    {
+        if (std::is_trivially_destructible<INode>::value) return;
+        destroySubtree(iroot_);
+        iroot_ = nullptr;
+        while (freeList_)
+        {
+            INode* n  = freeList_;
+            freeList_ = n->child1;
+            n->~INode();
+        }
+    }
+
+    void destroySubtree(INode* n)
+    {
+        if (!n) return;
+        destroySubtree(n->child1);
+        destroySubtree(n->child2);
+        n->~INode();
+    }
+
+    // --------------------------------------------------------------------
+    //  Helpers
+    // --------------------------------------------------------------------
+    ElementType pt(IndexType idx, Dimension d) const
+    {
+        return dataset_.kdtree_get_pt(idx, d);
+    }
+
+    void ensureNodeMap(IndexType idx)
+    {
+        if (idx >= nodeOfPoint_.size()) nodeOfPoint_.resize(static_cast<size_t>(idx) + 1, nullptr);
+    }
+
+    void syncRootBox()
+    {
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        if (iroot_)
+            for (Dimension i = 0; i < dims; ++i) Base::root_bbox_[i] = iroot_->box[i];
+        else
+            for (Dimension i = 0; i < dims; ++i) Base::root_bbox_[i] = Interval{0, 0};
+    }
+
+    void initBoxToPoint(INode* n)
+    {
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+        {
+            const ElementType v = pt(n->ptIdx, i);
+            n->box[i].low = n->box[i].high = v;
+        }
+    }
+
+    void expandBoxToPoint(INode* n, IndexType idx)
+    {
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+        {
+            const ElementType v = pt(idx, i);
+            if (v < n->box[i].low) n->box[i].low = v;
+            if (v > n->box[i].high) n->box[i].high = v;
+        }
+    }
+
+    void unionBox(INode* n, const INode* c)
+    {
+        if (!c) return;
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+        {
+            if (c->box[i].low < n->box[i].low) n->box[i].low = c->box[i].low;
+            if (c->box[i].high > n->box[i].high) n->box[i].high = c->box[i].high;
+        }
+    }
+
+    bool pointInBox(IndexType idx, const BoundingBox& b) const
+    {
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+        {
+            const ElementType v = pt(idx, i);
+            if (v < b[i].low || v > b[i].high) return false;
+        }
+        return true;
+    }
+
+    bool boxFullyInside(const BoundingBox& inner, const BoundingBox& outer) const
+    {
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+            if (inner[i].low < outer[i].low || inner[i].high > outer[i].high) return false;
+        return true;
+    }
+
+    bool boxDisjoint(const BoundingBox& a, const BoundingBox& b) const
+    {
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        for (Dimension i = 0; i < dims; ++i)
+            if (a[i].high < b[i].low || a[i].low > b[i].high) return true;
+        return false;
+    }
+
+    // --------------------------------------------------------------------
+    //  Insertion
+    // --------------------------------------------------------------------
+    INode* makeLeaf(IndexType idx, Dimension depth, INode* parent)
+    {
+        INode* n = allocNode();
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+        n->ptIdx        = idx;
+        n->divfeat      = static_cast<Dimension>(depth % dims);
+        n->deleted      = false;
+        n->treeDeleted  = false;
+        n->child1 = n->child2 = nullptr;
+        n->parent       = parent;
+        n->subtree_size = 1;
+        n->invalid_count = 0;
+        initBoxToPoint(n);
+        cacheCoords(n);
+        nodeOfPoint_[idx] = n;
+        return n;
+    }
+
+    /** Insert one point and, in the same pass, rebuild the highest unbalanced
+     *  node on the insertion path (BB[alpha] scapegoat rebalancing). */
+    void insertOne(IndexType idx)
+    {
+        pendingRebuild_ = nullptr;
+        iroot_          = insertRec(iroot_, idx, 0, nullptr);
+        ++liveCount_;
+        ++totalCount_;
+        if (pendingRebuild_ && inlineRebuild_) rebuildAt(pendingRebuild_);
+    }
+
+    INode* insertRec(INode* node, IndexType idx, Dimension depth, INode* parent)
+    {
+        if (!node) return makeLeaf(idx, depth, parent);
+        if (node->treeDeleted) pushDownDelete(node);
+
+        ++node->subtree_size;
+        expandBoxToPoint(node, idx);
+
+        const Dimension axis = node->divfeat;
+        if (pt(idx, axis) < nodeCoord(node, axis))
+            node->child1 = insertRec(node->child1, idx, static_cast<Dimension>(depth + 1), node);
+        else
+            node->child2 = insertRec(node->child2, idx, static_cast<Dimension>(depth + 1), node);
+
+        // On the unwind, remember the *highest* unbalanced node seen on the
+        // path (ancestors are visited after descendants, so the last write
+        // wins). insertOne() rebuilds it once, avoiding a second descent.
+        if (isBalanceScapegoat(node)) pendingRebuild_ = node;
+        return node;
+    }
+
+    /** Make the lazy whole-subtree tombstone one level explicit so the subtree
+     *  is consistent before we descend into it for an insertion. */
+    void pushDownDelete(INode* node)
+    {
+        node->deleted = true;
+        if (node->child1)
+        {
+            node->child1->treeDeleted   = true;
+            node->child1->invalid_count = node->child1->subtree_size;
+        }
+        if (node->child2)
+        {
+            node->child2->treeDeleted   = true;
+            node->child2->invalid_count = node->child2->subtree_size;
+        }
+        node->treeDeleted = false;  // invalid_count already == subtree_size
+    }
+
+    Size maxChildSize(const INode* node) const
+    {
+        const Size l = node->child1 ? node->child1->subtree_size : 0;
+        const Size r = node->child2 ? node->child2->subtree_size : 0;
+        return l > r ? l : r;
+    }
+
+    bool isBalanceScapegoat(const INode* node) const
+    {
+        if (node->subtree_size < kMinBalanceRebuild) return false;
+        return static_cast<float>(maxChildSize(node)) >
+               alphaBal_ * static_cast<float>(node->subtree_size);
+    }
+
+    // --------------------------------------------------------------------
+    //  Deletion (lazy) + box-region deletion
+    // --------------------------------------------------------------------
+    /** Kill an entire subtree in O(1): mark it as wholly tombstoned. */
+    void killSubtree(INode* node)
+    {
+        node->treeDeleted   = true;
+        node->invalid_count = node->subtree_size;
+    }
+
+    /** Remove points outside \a keep. Returns the number newly tombstoned. */
+    Size removeOutsideBoxRec(INode* node, const BoundingBox& keep)
+    {
+        if (!node) return 0;
+        if (node->invalid_count == node->subtree_size) return 0;  // already all dead
+        if (boxFullyInside(node->box, keep)) return 0;  // keep entire subtree
+        if (boxDisjoint(node->box, keep))
+        {
+            const Size newly = node->subtree_size - node->invalid_count;
+            killSubtree(node);
+            liveCount_ -= newly;
+            return newly;
+        }
+        Size newly = 0;
+        if (!node->deleted && !nodeInBox(node, keep))
+        {
+            node->deleted = true;
+            ++newly;
+            --liveCount_;
+        }
+        newly += removeOutsideBoxRec(node->child1, keep);
+        newly += removeOutsideBoxRec(node->child2, keep);
+        node->invalid_count += newly;
+        return newly;
+    }
+
+    /** Remove points inside \a box. Returns the number newly tombstoned. */
+    Size removeBoxRec(INode* node, const BoundingBox& box)
+    {
+        if (!node) return 0;
+        if (node->invalid_count == node->subtree_size) return 0;
+        if (boxDisjoint(node->box, box)) return 0;  // nothing inside
+        if (boxFullyInside(node->box, box))
+        {
+            const Size newly = node->subtree_size - node->invalid_count;
+            killSubtree(node);
+            liveCount_ -= newly;
+            return newly;
+        }
+        Size newly = 0;
+        if (!node->deleted && nodeInBox(node, box))
+        {
+            node->deleted = true;
+            ++newly;
+            --liveCount_;
+        }
+        newly += removeBoxRec(node->child1, box);
+        newly += removeBoxRec(node->child2, box);
+        node->invalid_count += newly;
+        return newly;
+    }
+
+    bool isDeletionScapegoat(const INode* node) const
+    {
+        if (node->subtree_size == 0) return false;
+        return static_cast<float>(node->invalid_count) >
+               alphaDel_ * static_cast<float>(node->subtree_size);
+    }
+
+    INode* findDeletionScapegoat(INode* node) const
+    {
+        if (!node) return nullptr;
+        if (isDeletionScapegoat(node)) return node;  // highest wins
+        if (INode* l = findDeletionScapegoat(node->child1)) return l;
+        return findDeletionScapegoat(node->child2);
+    }
+
+    void maybeRebuildForDeletion()
+    {
+        if (!iroot_ || !inlineRebuild_) return;
+        if (INode* sg = findDeletionScapegoat(iroot_)) rebuildAt(sg);
+    }
+
+    // --------------------------------------------------------------------
+    //  Partial rebuild (scapegoat): flatten live points, rebuild balanced
+    // --------------------------------------------------------------------
+    void rebuildAt(INode* node)
+    {
+        INode*  par  = node->parent;
+        INode** link = par ? (par->child1 == node ? &par->child1 : &par->child2) : &iroot_;
+
+        const Size oldSize    = node->subtree_size;
+        const Size oldInvalid = node->invalid_count;
+
+        buildBuf_.clear();
+        collectLiveAndFree(node, buildBuf_);
+
+        INode* nb = buildBalanced(buildBuf_, 0, buildBuf_.size(), 0, par);
+        *link     = nb;
+
+        const Size newSize = nb ? nb->subtree_size : 0;  // == number of live pts
+        // Propagate the change in (size, invalid) up to the ancestors.
+        for (INode* p = par; p; p = p->parent)
+        {
+            p->subtree_size  = p->subtree_size - oldSize + newSize;
+            p->invalid_count = p->invalid_count - oldInvalid;
+        }
+        totalCount_ = totalCount_ - oldSize + newSize;
+    }
+
+    /** Collect the live point indices under \a node (DFS) and recycle every
+     *  node to the free-list. Tombstoned points are dropped (and optionally
+     *  recorded for acquireRemovedPoints()). */
+    void collectLiveAndFree(INode* node, std::vector<IndexType>& out)
+    {
+        if (!node) return;
+        if (node->treeDeleted)
+        {
+            freeDeadSubtree(node);
+            return;
+        }
+        if (!node->deleted)
+            out.push_back(node->ptIdx);
+        else
+            dropDeadPoint(node->ptIdx);
+        collectLiveAndFree(node->child1, out);
+        collectLiveAndFree(node->child2, out);
+        recycleNode(node);
+    }
+
+    void freeDeadSubtree(INode* node)
+    {
+        if (!node) return;
+        dropDeadPoint(node->ptIdx);
+        freeDeadSubtree(node->child1);
+        freeDeadSubtree(node->child2);
+        recycleNode(node);
+    }
+
+    void dropDeadPoint(IndexType idx)
+    {
+        if (idx < nodeOfPoint_.size()) nodeOfPoint_[idx] = nullptr;
+        if (collectRemoved_) removedSink_.push_back(idx);
+    }
+
+    /** DFS collecting live point indices (skips tombstoned points/subtrees). */
+    void snapshotRec(const INode* node, std::vector<IndexType>& out) const
+    {
+        if (!node) return;
+        if (node->invalid_count == node->subtree_size) return;  // whole subtree dead
+        if (!node->deleted) out.push_back(node->ptIdx);
+        snapshotRec(node->child1, out);
+        snapshotRec(node->child2, out);
+    }
+
+    /** DFS collecting every physically-stored index (live and tombstoned). */
+    void collectAllRec(const INode* node, std::vector<IndexType>& out) const
+    {
+        if (!node) return;
+        out.push_back(node->ptIdx);
+        collectAllRec(node->child1, out);
+        collectAllRec(node->child2, out);
+    }
+
+    /** Build a balanced subtree over buf[lo,hi) (median split on widest axis). */
+    INode* buildBalanced(
+        std::vector<IndexType>& buf, size_t lo, size_t hi, Dimension depth, INode* parent)
+    {
+        if (lo >= hi) return nullptr;
+        const Dimension dims = static_cast<Dimension>(this->veclen(*this));
+
+        // Widest-spread axis over buf[lo,hi).
+        Dimension   axis     = static_cast<Dimension>(depth % dims);
+        ElementType bestSpan = -1;
+        for (Dimension d = 0; d < dims; ++d)
+        {
+            ElementType mn = pt(buf[lo], d), mx = mn;
+            for (size_t k = lo + 1; k < hi; ++k)
+            {
+                const ElementType v = pt(buf[k], d);
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            const ElementType span = mx - mn;
+            if (span > bestSpan)
+            {
+                bestSpan = span;
+                axis     = d;
+            }
+        }
+
+        const size_t mid = lo + (hi - lo) / 2;
+        std::nth_element(
+            buf.begin() + lo, buf.begin() + mid, buf.begin() + hi,
+            [this, axis](IndexType a, IndexType b) { return pt(a, axis) < pt(b, axis); });
+
+        INode* node      = allocNode();
+        node->ptIdx      = buf[mid];
+        node->divfeat    = axis;
+        node->deleted    = false;
+        node->treeDeleted = false;
+        node->parent     = parent;
+        cacheCoords(node);
+        nodeOfPoint_[buf[mid]] = node;
+
+        node->child1 = buildBalanced(buf, lo, mid, static_cast<Dimension>(depth + 1), node);
+        node->child2 = buildBalanced(buf, mid + 1, hi, static_cast<Dimension>(depth + 1), node);
+
+        node->subtree_size  = hi - lo;
+        node->invalid_count = 0;
+        initBoxToPoint(node);
+        unionBox(node, node->child1);
+        unionBox(node, node->child2);
+        return node;
+    }
+
+    // --------------------------------------------------------------------
+    //  Search
+    // --------------------------------------------------------------------
+    template <class RESULTSET>
+    void searchLevelInc(
+        RESULTSET& rs, const ElementType* vec, const INode* node, DistanceType mindist,
+        distance_vector_t& dists, const DistanceType epsError, const Size dim) const
+    {
+        if (!node) return;
+        if (node->invalid_count == node->subtree_size) return;  // whole subtree dead
+
+        if (!node->deleted)
+        {
+#if defined(NANOFLANN_INCREMENTAL_INNODE_DISTANCE)
+            // Opt-in: compute the node distance from the in-node coordinate cache
+            // as a sum of per-axis accum_dist contributions. This avoids the
+            // dataset_get() indirection and is ~12% faster on KNN, but is only
+            // valid for *additive* (axis-decomposable) metrics — L1, L2,
+            // L2_Simple. Do NOT enable it for SO2/SO3.
+            DistanceType d = DistanceType();
+            if (kCacheCoords)
+                for (Size i = 0; i < dim; ++i)
+                    d += distance_.accum_dist(
+                        vec[i], node->pcoord[static_cast<Dimension>(i)], static_cast<Dimension>(i));
+            else
+                d = distance_.evalMetric(vec, node->ptIdx, dim);
+#else
+            const DistanceType d = distance_.evalMetric(vec, node->ptIdx, dim);
+#endif
+            if (d < rs.worstDist())
+                rs.addPoint(
+                    static_cast<typename RESULTSET::DistanceType>(d),
+                    static_cast<typename RESULTSET::IndexType>(node->ptIdx));
+        }
+
+        const Dimension    axis     = node->divfeat;
+        const ElementType  splitval = nodeCoord(node, axis);
+        const ElementType  val      = vec[axis];
+        const DistanceType cut      = distance_.accum_dist(val, splitval, axis);
+
+        const INode* nearChild;
+        const INode* farChild;
+        if (val < splitval)
+        {
+            nearChild = node->child1;
+            farChild  = node->child2;
+        }
+        else
+        {
+            nearChild = node->child2;
+            farChild  = node->child1;
+        }
+
+        searchLevelInc(rs, vec, nearChild, mindist, dists, epsError, dim);
+
+        const DistanceType dst    = dists[axis];
+        const DistanceType newmin = mindist + cut - dst;
+        dists[axis]               = cut;
+        if (newmin * epsError <= rs.worstDist())
+            searchLevelInc(rs, vec, farChild, newmin, dists, epsError, dim);
+        dists[axis] = dst;
+    }
+
+    template <typename RESULTSET>
+    void findWithinBoxRec(RESULTSET& result, const INode* node, const BoundingBox& bbox) const
+    {
+        if (!node) return;
+        if (node->invalid_count == node->subtree_size) return;
+        if (boxDisjoint(node->box, bbox)) return;
+        if (!node->deleted && nodeInBox(node, bbox)) result.addPoint(0, node->ptIdx);
+        findWithinBoxRec(result, node->child1, bbox);
+        findWithinBoxRec(result, node->child2, bbox);
+    }
+};
+
+#ifndef NANOFLANN_NO_THREADS
+/** Multi-threaded variant of KDTreeSingleIndexIncrementalAdaptor that hides the
+ *  O(N) near-root rebuild spike: the large balancing rebuild is performed on a
+ *  background thread while the foreground tree keeps serving inserts, deletions
+ *  and queries.
+ *
+ *  Model (single foreground thread + one background rebuild thread):
+ *   - The live ("active") tree never rebalances inline; it only appends and
+ *     lazily tombstones, so every foreground call returns quickly.
+ *   - When the active tree has grown / accumulated tombstones past a threshold,
+ *     a snapshot of its live point indices is taken and a background thread
+ *     bulk-builds a fresh, balanced tree from it. Foreground operations meanwhile
+ *     keep mutating the active tree and are appended to a small op-log.
+ *   - At the next foreground call after the build finishes, the op-log is
+ *     replayed onto the fresh tree and it atomically replaces the active tree.
+ *
+ *  This keeps the foreground tail latency bounded (snapshot + replay) instead of
+ *  paying the full O(N) rebuild inline. It matches ikd-Tree's async-rebuild idea
+ *  but with a thread-isolated build (no per-node locks), a bounded `std::deque`-
+ *  style op-log (no fixed 10⁶ queue), and no PCL/pthread dependency.
+ *
+ *  \warning Same threading contract as the synchronous index for the *foreground*
+ *  thread (const queries are safe for concurrent readers; no concurrent writer).
+ *  Additionally, because the background thread reads point coordinates from the
+ *  dataset adaptor, the **dataset must keep stable element storage while a
+ *  rebuild is in flight** (e.g. `reserve()` the backing vector, or use a
+ *  std::deque) so that appends on the foreground thread do not reallocate it.
+ *  Disabled entirely under NANOFLANN_NO_THREADS.
+ */
+template <typename Distance, class DatasetAdaptor, int32_t DIM = -1, typename IndexType = uint32_t>
+class KDTreeSingleIndexIncrementalAdaptorMT
+{
+   public:
+    using Inner = KDTreeSingleIndexIncrementalAdaptor<Distance, DatasetAdaptor, DIM, IndexType>;
+    using ElementType  = typename Inner::ElementType;
+    using DistanceType = typename Inner::DistanceType;
+    using Size         = typename Inner::Size;
+    using Dimension    = typename Inner::Dimension;
+    using BoundingBox  = typename Inner::BoundingBox;
+
+    /** Constructor.
+     *  @param rebuild_growth Trigger a background rebuild once the physical node
+     *         count exceeds this factor of the live count at the last rebuild
+     *         (captures both appends and tombstone accumulation).
+     *  @param min_rebuild_size Never trigger below this many physical nodes. */
+    explicit KDTreeSingleIndexIncrementalAdaptorMT(
+        const Dimension dimensionality, const DatasetAdaptor& inputData,
+        const KDTreeIncrementalIndexParams& params = {}, double rebuild_growth = 1.3,
+        Size min_rebuild_size = 10000)
+        : dataset_(inputData),
+          dim_(dimensionality),
+          params_(params),
+          rebuildGrowth_(rebuild_growth),
+          minRebuildSize_(min_rebuild_size)
+    {
+        active_.reset(new Inner(dimensionality, inputData, params));
+        active_->setInlineRebuild(false);
+    }
+
+    KDTreeSingleIndexIncrementalAdaptorMT(const KDTreeSingleIndexIncrementalAdaptorMT&) = delete;
+    KDTreeSingleIndexIncrementalAdaptorMT& operator=(
+        const KDTreeSingleIndexIncrementalAdaptorMT&) = delete;
+
+    ~KDTreeSingleIndexIncrementalAdaptorMT()
+    {
+        if (fut_.valid()) fut_.wait();  // let the worker finish before teardown
+    }
+
+    /** \name Modifiers @{ */
+    void addPoints(IndexType start, IndexType end)
+    {
+        integrateIfReady();
+        active_->addPoints(start, end);
+        if (building_) log_.push_back({OpKind::Add, start, end, {}});
+        maybeTriggerRebuild();
+    }
+    void addPoint(IndexType idx) { addPoints(idx, idx); }
+
+    void removePoint(IndexType idx)
+    {
+        integrateIfReady();
+        active_->removePoint(idx);
+        if (building_) log_.push_back({OpKind::Remove, idx, idx, {}});
+        maybeTriggerRebuild();
+    }
+    void removeBox(const BoundingBox& box)
+    {
+        integrateIfReady();
+        active_->removeBox(box);
+        if (building_) log_.push_back({OpKind::RemoveBox, 0, 0, box});
+        maybeTriggerRebuild();
+    }
+    void removeOutsideBox(const BoundingBox& keep)
+    {
+        integrateIfReady();
+        active_->removeOutsideBox(keep);
+        if (building_) log_.push_back({OpKind::RemoveOutsideBox, 0, 0, keep});
+        maybeTriggerRebuild();
+    }
+    /** @} */
+
+    /** \name Query methods (forwarded to the active tree) @{ */
+    template <typename RESULTSET>
+    bool findNeighbors(
+        RESULTSET& result, const ElementType* vec, const SearchParameters& sp = {}) const
+    {
+        return active_->findNeighbors(result, vec, sp);
+    }
+    Size knnSearch(
+        const ElementType* query_point, const Size num_closest, IndexType* out_indices,
+        DistanceType* out_distances, const SearchParameters& sp = {}) const
+    {
+        return active_->knnSearch(query_point, num_closest, out_indices, out_distances, sp);
+    }
+    Size radiusSearch(
+        const ElementType* query_point, const DistanceType& radius,
+        std::vector<ResultItem<IndexType, DistanceType>>& IndicesDists,
+        const SearchParameters& sp = {}) const
+    {
+        return active_->radiusSearch(query_point, radius, IndicesDists, sp);
+    }
+    Size rknnSearch(
+        const ElementType* query_point, const Size num_closest, IndexType* out_indices,
+        DistanceType* out_distances, const DistanceType& radius) const
+    {
+        return active_->rknnSearch(query_point, num_closest, out_indices, out_distances, radius);
+    }
+    template <typename RESULTSET>
+    Size findWithinBox(RESULTSET& result, const BoundingBox& bbox) const
+    {
+        return active_->findWithinBox(result, bbox);
+    }
+    /** @} */
+
+    /** \name Observers @{ */
+    Size size() const noexcept { return active_->size(); }
+    bool empty() const noexcept { return active_->empty(); }
+    Size physicalSize() const noexcept { return active_->physicalSize(); }
+    bool isRebuilding() const noexcept { return building_; }
+
+    /** Live AABB of the active tree (see the synchronous index). */
+    NANOFLANN_NODISCARD BoundingBox boundingBox() const { return active_->boundingBox(); }
+
+    /** Append the live point indices of the active tree into \a out. */
+    void snapshotLiveIndices(std::vector<IndexType>& out) const
+    {
+        active_->snapshotLiveIndices(out);
+    }
+
+    /** Pre-size the active tree's internal map (see the synchronous index). */
+    void reserve(Size n) { active_->reserve(n); }
+
+    /** Block until any in-flight background rebuild has been integrated. */
+    void sync()
+    {
+        if (building_ && fut_.valid()) fut_.wait();
+        integrateIfReady();
+    }
+
+    /** Access the underlying active tree (e.g. for further query types). */
+    const Inner& activeIndex() const { return *active_; }
+    /** @} */
+
+    /** Set a callback invoked **on the background worker thread** on each freshly
+     *  built tree, right after it is balanced and before it is handed back for
+     *  integration. Lets the caller recompute per-point auxiliary data (e.g.
+     *  covariances) off the foreground thread. The callback runs concurrently
+     *  with foreground queries on the *old* tree, so it must only touch the
+     *  passed-in fresh index and its own/snapshot data — never foreground-shared
+     *  state without external synchronization. Pass {} to clear. */
+    void setRebuildCallback(std::function<void(Inner&)> cb) { rebuildCallback_ = std::move(cb); }
+
+    /** \name Dataset-storage reclamation @{ */
+
+    /** Enable recording of dataset slots that become free when a background
+     *  rebuild drops tombstoned points (so the caller can recycle them and keep
+     *  the dataset bounded). Off by default (cost-free when unused). */
+    void setCollectRemovedPoints(bool enable)
+    {
+        collectRemoved_ = enable;
+        if (!enable) std::vector<IndexType>().swap(removedSink_);
+    }
+
+    /** Move out the point indices whose dataset slots became free since the last
+     *  call (no live OR tombstoned tree node references them — safe to recycle).
+     *  Requires setCollectRemovedPoints(true). */
+    std::vector<IndexType> acquireRemovedPoints()
+    {
+        std::vector<IndexType> out;
+        out.swap(removedSink_);
+        return out;
+    }
+    /** @} */
+
+   private:
+    enum class OpKind { Add, Remove, RemoveBox, RemoveOutsideBox };
+    struct LoggedOp
+    {
+        OpKind      kind;
+        IndexType   a, b;
+        BoundingBox box;
+    };
+
+    void maybeTriggerRebuild()
+    {
+        if (building_) return;
+        const Size phys = active_->physicalSize();
+        if (phys < minRebuildSize_) return;
+        const Size base = lastBuildLive_ ? lastBuildLive_ : Size(1);
+        if (static_cast<double>(phys) < rebuildGrowth_ * static_cast<double>(base)) return;
+
+        // Snapshot the live indices on the foreground thread, then build a fresh
+        // balanced tree from them on a background thread.
+        auto snapshot = std::make_shared<std::vector<IndexType>>();
+        active_->snapshotLiveIndices(*snapshot);
+
+        const DatasetAdaptor&        ds = dataset_;
+        const Dimension              d  = dim_;
+        KDTreeIncrementalIndexParams p  = params_;
+        std::function<void(Inner&)>  cb = rebuildCallback_;
+        fut_ = std::async(
+            std::launch::async,
+            [snapshot, &ds, d, p, cb]() -> std::unique_ptr<Inner>
+            {
+                std::unique_ptr<Inner> t(new Inner(d, ds, p));
+                t->setInlineRebuild(false);
+                t->buildFromIndices(*snapshot);
+                if (cb) cb(*t);  // background post-rebuild hook (e.g. recompute covariances)
+                return t;
+            });
+        building_ = true;
+        log_.clear();
+    }
+
+    void integrateIfReady()
+    {
+        if (!building_ || !fut_.valid()) return;
+        if (fut_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+
+        std::unique_ptr<Inner> fresh = fut_.get();
+        fresh->setInlineRebuild(false);
+        // Replay the operations buffered while the background build was running.
+        for (const auto& op : log_)
+        {
+            switch (op.kind)
+            {
+                case OpKind::Add: fresh->addPoints(op.a, op.b); break;
+                case OpKind::Remove: fresh->removePoint(op.a); break;
+                case OpKind::RemoveBox: fresh->removeBox(op.box); break;
+                case OpKind::RemoveOutsideBox: fresh->removeOutsideBox(op.box); break;
+            }
+        }
+        log_.clear();
+        // Dataset slots referenced by the OLD tree but not by the fresh one are
+        // now free for the caller to recycle (no node references them anymore).
+        if (collectRemoved_)
+        {
+            std::vector<IndexType> oldPhysical;
+            active_->collectPhysicalIndices(oldPhysical);
+            for (IndexType idx : oldPhysical)
+                if (!fresh->referencesIndex(idx)) removedSink_.push_back(idx);
+        }
+        active_        = std::move(fresh);
+        lastBuildLive_ = active_->size();
+        building_      = false;
+    }
+
+    const DatasetAdaptor&        dataset_;
+    Dimension                    dim_;
+    KDTreeIncrementalIndexParams params_;
+    double                       rebuildGrowth_;
+    Size                         minRebuildSize_;
+
+    std::unique_ptr<Inner>              active_;
+    std::future<std::unique_ptr<Inner>> fut_;
+    bool                                building_      = false;
+    Size                                lastBuildLive_ = 0;
+    std::vector<LoggedOp>               log_;
+
+    bool                                collectRemoved_ = false;
+    std::vector<IndexType>              removedSink_;
+    std::function<void(Inner&)>         rebuildCallback_;
+};
+#endif  // NANOFLANN_NO_THREADS
 
 /** An L2-metric KD-tree adaptor for working with data directly stored in an
  * Eigen Matrix, without duplicating the data storage. You can select whether a
