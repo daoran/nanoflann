@@ -3039,6 +3039,19 @@ class KDTreeSingleIndexIncrementalAdaptor
                nodeOfPoint_.capacity() * sizeof(INode*);
     }
 
+    /** Axis-aligned bounding box of all points currently in the index (live and
+     *  not-yet-reclaimed tombstones — a conservative superset of the live set).
+     *  O(1): returns the cached root box. Meaningless if empty() (all zeros). */
+    NANOFLANN_NODISCARD BoundingBox boundingBox() const { return Base::root_bbox_; }
+
+    /** Pre-size the internal index->node map (and the rebuild scratch buffer) to
+     *  avoid reallocations while the point count grows toward \a n. */
+    void reserve(Size n)
+    {
+        nodeOfPoint_.reserve(n);
+        buildBuf_.reserve(n);
+    }
+
     /** @} */
 
     /** \name Query methods
@@ -3787,6 +3800,18 @@ class KDTreeSingleIndexIncrementalAdaptorMT
     Size physicalSize() const noexcept { return active_->physicalSize(); }
     bool isRebuilding() const noexcept { return building_; }
 
+    /** Live AABB of the active tree (see the synchronous index). */
+    NANOFLANN_NODISCARD BoundingBox boundingBox() const { return active_->boundingBox(); }
+
+    /** Append the live point indices of the active tree into \a out. */
+    void snapshotLiveIndices(std::vector<IndexType>& out) const
+    {
+        active_->snapshotLiveIndices(out);
+    }
+
+    /** Pre-size the active tree's internal map (see the synchronous index). */
+    void reserve(Size n) { active_->reserve(n); }
+
     /** Block until any in-flight background rebuild has been integrated. */
     void sync()
     {
@@ -3797,6 +3822,15 @@ class KDTreeSingleIndexIncrementalAdaptorMT
     /** Access the underlying active tree (e.g. for further query types). */
     const Inner& activeIndex() const { return *active_; }
     /** @} */
+
+    /** Set a callback invoked **on the background worker thread** on each freshly
+     *  built tree, right after it is balanced and before it is handed back for
+     *  integration. Lets the caller recompute per-point auxiliary data (e.g.
+     *  covariances) off the foreground thread. The callback runs concurrently
+     *  with foreground queries on the *old* tree, so it must only touch the
+     *  passed-in fresh index and its own/snapshot data — never foreground-shared
+     *  state without external synchronization. Pass {} to clear. */
+    void setRebuildCallback(std::function<void(Inner&)> cb) { rebuildCallback_ = std::move(cb); }
 
     /** \name Dataset-storage reclamation @{ */
 
@@ -3845,13 +3879,15 @@ class KDTreeSingleIndexIncrementalAdaptorMT
         const DatasetAdaptor&        ds = dataset_;
         const Dimension              d  = dim_;
         KDTreeIncrementalIndexParams p  = params_;
+        std::function<void(Inner&)>  cb = rebuildCallback_;
         fut_ = std::async(
             std::launch::async,
-            [snapshot, &ds, d, p]() -> std::unique_ptr<Inner>
+            [snapshot, &ds, d, p, cb]() -> std::unique_ptr<Inner>
             {
                 std::unique_ptr<Inner> t(new Inner(d, ds, p));
                 t->setInlineRebuild(false);
                 t->buildFromIndices(*snapshot);
+                if (cb) cb(*t);  // background post-rebuild hook (e.g. recompute covariances)
                 return t;
             });
         building_ = true;
@@ -3905,6 +3941,7 @@ class KDTreeSingleIndexIncrementalAdaptorMT
 
     bool                                collectRemoved_ = false;
     std::vector<IndexType>              removedSink_;
+    std::function<void(Inner&)>         rebuildCallback_;
 };
 #endif  // NANOFLANN_NO_THREADS
 

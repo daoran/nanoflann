@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>  // for abs()
 #include <cstdlib>
 #include <iostream>
@@ -1787,6 +1788,87 @@ TEST(kdtree_incremental, removeOutsideBox_acquireRemovedPoints)
     EXPECT_TRUE(index.acquireRemovedPoints().empty());
 }
 
+// boundingBox(), reserve(), and buildFromIndices() on a *populated* index
+// (rebuild-from-subset; exercises the recycle-existing-nodes branch).
+TEST(kdtree_incremental, buildFromIndices_boundingBox_reserve)
+{
+    inc_cloud_t cloud;
+    inc_tree_t  index(3, cloud);
+    index.reserve(1000);  // pre-size the index->node map
+    const size_t N = 600;
+    for (size_t i = 0; i < N; ++i)
+        cloud.pts.push_back({static_cast<double>(i % 10), static_cast<double>((i / 10) % 10),
+                             static_cast<double>(i / 100)});
+    index.addPoints(0, static_cast<uint32_t>(N) - 1);
+
+    // boundingBox encloses all inserted points.
+    auto bb = index.boundingBox();
+    EXPECT_LE(bb[0].low, 0.0);
+    EXPECT_GE(bb[0].high, 9.0);
+    EXPECT_GE(bb[2].high, 5.0);
+
+    // Rebuild from a subset of indices (this index is non-empty -> takes the
+    // recycle-existing-nodes path inside buildFromIndices).
+    std::vector<uint32_t> subset;
+    for (uint32_t i = 0; i < N; i += 2) subset.push_back(i);  // keep even indices
+    index.buildFromIndices(subset);
+    EXPECT_EQ(index.size(), subset.size());
+    EXPECT_EQ(index.physicalSize(), subset.size());  // fresh balanced tree, no tombstones
+
+    // KNN now only returns kept (even) indices.
+    std::set<uint32_t> kept(subset.begin(), subset.end());
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const double q[3] = {cloud.pts[i].x, cloud.pts[i].y, cloud.pts[i].z};
+        uint32_t     ri;
+        double       rd;
+        ASSERT_EQ(index.knnSearch(q, 1, &ri, &rd), 1u);
+        EXPECT_TRUE(kept.count(ri) == 1);
+    }
+}
+
+// Insert into a region whose subtree was bulk-killed by removeOutsideBox while
+// inline rebuilds are disabled, so the lazy whole-subtree tombstone survives and
+// the insertion descent must push it down (covers pushDownDelete()).
+TEST(kdtree_incremental, pushdown_delete_into_killed_region)
+{
+    inc_cloud_t cloud;
+    inc_tree_t  index(3, cloud);
+    index.setInlineRebuild(false);  // keep treeDeleted subtrees around (no reclaim)
+
+    // Two well-separated clusters so they live in separate subtrees.
+    for (int i = 0; i < 200; ++i) cloud.pts.push_back({0.1 * i / 200.0, 0.0, 0.0});  // A near x=0
+    for (int i = 0; i < 200; ++i)
+        cloud.pts.push_back({100.0 + 0.1 * i / 200.0, 0.0, 0.0});  // B near x=100
+    index.addPoints(0, 399);
+    ASSERT_EQ(index.size(), 400u);
+
+    // Kill cluster B (everything with x>10): its subtree becomes treeDeleted and,
+    // with inline rebuild off, is NOT reclaimed.
+    inc_tree_t::BoundingBox keep;
+    keep[0].low = -1; keep[0].high = 10;
+    keep[1].low = -1; keep[1].high = 1;
+    keep[2].low = -1; keep[2].high = 1;
+    index.removeOutsideBox(keep);
+    ASSERT_EQ(index.size(), 200u);  // only cluster A remains live
+
+    // Now insert a fresh point inside the killed region (x~100): the descent
+    // reaches the treeDeleted subtree and must push the deletion down.
+    const uint32_t newIdx = static_cast<uint32_t>(cloud.pts.size());
+    cloud.pts.push_back({100.05, 0.0, 0.0});
+    index.addPoint(newIdx);
+    EXPECT_EQ(index.size(), 201u);
+
+    // The new point is the nearest neighbor of its own location; the old killed
+    // points stay deleted.
+    const double q[3] = {100.05, 0.0, 0.0};
+    uint32_t     ri;
+    double       rd;
+    ASSERT_EQ(index.knnSearch(q, 1, &ri, &rd), 1u);
+    EXPECT_EQ(ri, newIdx);
+    EXPECT_NEAR(rd, 0.0, 1e-9);
+}
+
 #ifndef NANOFLANN_NO_THREADS
 TEST(kdtree_incremental, async_mt_vs_bruteforce_under_churn)
 {
@@ -1907,6 +1989,93 @@ TEST(kdtree_incremental, async_mt_slot_recycling_bounds_dataset)
         ASSERT_EQ(n, 1u);
         EXPECT_TRUE(live.count(ri) == 1);
         uint32_t bi;
+        const double bd = bruteforce_nn(cloud, live, q, bi);
+        EXPECT_NEAR(rd, bd, 1e-9);
+    }
+}
+
+// Exercises the MT wrapper's op-log replay for Remove and RemoveBox (ops issued
+// while a background rebuild is in flight), the background rebuild callback, and
+// the forwarder observers (boundingBox / snapshotLiveIndices / reserve).
+TEST(kdtree_incremental, async_mt_replay_remove_box_and_callback)
+{
+    using mt_tree_t = nanoflann::KDTreeSingleIndexIncrementalAdaptorMT<
+        nanoflann::L2_Simple_Adaptor<double, inc_cloud_t>, inc_cloud_t, 3, uint32_t>;
+
+    inc_cloud_t cloud;
+    cloud.pts.reserve(600000);  // stable storage for the background reads
+    mt_tree_t   index(3, cloud, nanoflann::KDTreeIncrementalIndexParams(0.8f, 0.5f), 1.3, 2000);
+    index.reserve(600000);
+
+    // The callback runs on the background worker thread for each rebuilt tree.
+    std::atomic<int> cbCalls{0};
+    index.setRebuildCallback(
+        [&cbCalls](mt_tree_t::Inner& fresh)
+        {
+            // Touch the fresh tree to make sure it is usable inside the callback.
+            (void)fresh.size();
+            cbCalls.fetch_add(1, std::memory_order_relaxed);
+        });
+
+    std::set<uint32_t> live;
+    std::mt19937       g(123);
+    std::uniform_real_distribution<double> U(-50.0, 50.0);
+
+    auto inBox = [](const inc_cloud_t& c, uint32_t i, const double lo[3], const double hi[3])
+    { return inc_in_box(c, i, lo, hi); };
+
+    // Several rounds: each big insert re-triggers a background rebuild, and the
+    // removePoint / removeBox issued right afterwards land in the op-log while
+    // the (large) build is still running.
+    for (int round = 0; round < 4; ++round)
+    {
+        const uint32_t start = static_cast<uint32_t>(cloud.pts.size());
+        for (int i = 0; i < 60000; ++i) cloud.pts.push_back({U(g), U(g), U(g)});
+        const uint32_t end = static_cast<uint32_t>(cloud.pts.size()) - 1;
+        index.addPoints(start, end);  // triggers a background rebuild
+        for (uint32_t i = start; i <= end; ++i) live.insert(i);
+
+        // Remove a handful of individual points (logged Remove while building).
+        for (uint32_t k = 0; k < 20; ++k)
+        {
+            const uint32_t victim = start + k * 7;
+            index.removePoint(victim);
+            live.erase(victim);
+        }
+        // Remove a box region (logged RemoveBox while building).
+        const double blo[3] = {-50, -50, -50}, bhi[3] = {-30, -30, -30};
+        mt_tree_t::BoundingBox box;
+        for (int d = 0; d < 3; ++d) { box[d].low = blo[d]; box[d].high = bhi[d]; }
+        index.removeBox(box);
+        for (auto it = live.begin(); it != live.end();)
+        {
+            if (inBox(cloud, *it, blo, bhi)) it = live.erase(it);
+            else ++it;
+        }
+    }
+    index.sync();  // drain the final background rebuild (replays the op-log)
+
+    EXPECT_GT(cbCalls.load(), 0);  // background callback actually ran
+    EXPECT_EQ(index.size(), live.size());
+
+    // Forwarder observers:
+    EXPECT_EQ(index.physicalSize() >= index.size(), true);
+    std::vector<uint32_t> liveIdx;
+    index.snapshotLiveIndices(liveIdx);
+    EXPECT_EQ(liveIdx.size(), live.size());
+    auto bb = index.boundingBox();
+    EXPECT_LE(bb[0].low, bb[0].high);
+
+    // Correctness vs brute force on the final live set.
+    for (int t = 0; t < 500; ++t)
+    {
+        const double q[3] = {U(g), U(g), U(g)};
+        uint32_t     ri;
+        double       rd;
+        const size_t n = index.knnSearch(q, 1, &ri, &rd);
+        ASSERT_EQ(n, 1u);
+        EXPECT_TRUE(live.count(ri) == 1);
+        uint32_t     bi;
         const double bd = bruteforce_nn(cloud, live, q, bi);
         EXPECT_NEAR(rd, bd, 1e-9);
     }
