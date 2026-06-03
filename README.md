@@ -109,7 +109,10 @@ Refer to the examples below or to the C++ API of [nanoflann::KDTreeSingleIndexAd
     * [nanoflann::KDTreeSingleIndexAdaptor<>](https://jlblancoc.github.io/nanoflann/classnanoflann_1_1KDTreeSingleIndexAdaptor.html)`::findWithinBox()` [New in 1.8.0]: Optimized search within a given axis-aligned bound box.
   * Working with 2D and 3D point clouds or N-dimensional data sets.
   * Working directly with `Eigen::Matrix<>` classes (matrices and vectors-of-vectors).
-  * Working with dynamic point clouds without a need to rebuild entire kd-tree index.
+  * Working with dynamic point clouds without a need to rebuild entire kd-tree index. Two options:
+    * `nanoflann::KDTreeSingleIndexDynamicAdaptor<>`: the Bentley–Saxe "logarithmic forest" of static sub-trees.
+    * `nanoflann::KDTreeSingleIndexIncrementalAdaptor<>` [New]: a single self-balancing tree, recommended for sliding-window LiDAR-style maps. Supports incremental `addPoints`, lazy `removePoint`, and axis-aligned box trimming (`removeBox` / `removeOutsideBox`) with bounded memory under churn. See the design & benchmark report in [nanoflann-benchmark/incrementalTests](https://github.com/MRPT/nanoflann-benchmark/tree/master/incrementalTests/REPORT.md).
+    * `nanoflann::KDTreeSingleIndexIncrementalAdaptorMT<>` [New]: the same index with the large rebalancing rebuilds offloaded to a background thread, to bound the foreground update-latency tail (see the [threading analysis](https://github.com/MRPT/nanoflann-benchmark/tree/master/incrementalTests/async_rebalance.md)). Disabled under `NANOFLANN_NO_THREADS`.
   * Working with the distance metrics:
     * `R^N`: Euclidean spaces:
       * `L1` (Manhattan)
