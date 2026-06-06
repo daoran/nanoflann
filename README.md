@@ -7,6 +7,13 @@
 [![Windows build status](https://ci.appveyor.com/api/projects/status/h8k1apfogxyqhskd/branch/master?svg=true)](https://ci.appveyor.com/project/jlblancoc/nanoflann/branch/master)
 [![codecov](https://codecov.io/gh/jlblancoc/nanoflann/graph/badge.svg?token=yOKq5lpizE)](https://codecov.io/gh/jlblancoc/nanoflann)
 
+| Distro | Build dev |
+| ---    | ---       |
+| ROS 2 Humble (u22.04) | [![Build Status](https://build.ros2.org/job/Hdev__nanoflann__ubuntu_jammy_amd64/badge/icon)](https://build.ros2.org/job/Hdev__nanoflann__ubuntu_jammy_amd64/) |
+| ROS 2 Jazzy (u24.04) | [![Build Status](https://build.ros2.org/job/Jdev__nanoflann__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Jdev__nanoflann__ubuntu_noble_amd64/) |
+| ROS 2 Kilted (u24.04) | [![Build Status](https://build.ros2.org/job/Kdev__nanoflann__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Kdev__nanoflann__ubuntu_noble_amd64/) |
+| ROS 2 Rolling (u24.04) | [![Build Status](https://build.ros2.org/job/Rdev__nanoflann__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Rdev__nanoflann__ubuntu_noble_amd64/) |
+
 
 ## 1. About
 
