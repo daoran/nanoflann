@@ -1,3 +1,16 @@
+# nanoflann 1.10.0: Released Jun 6, 2026
+ - New: Incremental self-balancing dynamic k-d tree index (`KDTreeSingleIndexIncrementalAdaptor`), both single-threaded and multithreaded variants. See [#302](https://github.com/jlblancoc/nanoflann/pull/302).
+ - Performance: Hoist point-length computation out of search inner loops. See [#301](https://github.com/jlblancoc/nanoflann/pull/301).
+ - Refactor: Deduplicate tree builders, harden Eigen adaptor ownership, centralize DIM dispatch with `if constexpr`. See [#297](https://github.com/jlblancoc/nanoflann/pull/297), [#299](https://github.com/jlblancoc/nanoflann/pull/299), [#300](https://github.com/jlblancoc/nanoflann/pull/300).
+ - Fix: `SO2_Adaptor` now returns absolute angular distance instead of signed. See [#298](https://github.com/jlblancoc/nanoflann/pull/298).
+ - Fix: `saveIndex`/`loadIndex` now include a magic+version+type-size header and throw on mismatch. See [#295](https://github.com/jlblancoc/nanoflann/pull/295).
+ - Fix: `KDTreeSingleIndexDynamicAdaptor_` saveIndex/loadIndex infinite recursion. See [#290](https://github.com/jlblancoc/nanoflann/pull/290).
+ - Fix: loadIndex reading past EOF for empty indices. See [#287](https://github.com/jlblancoc/nanoflann/pull/287).
+ - Fix: duplicate-entry growth on removePoint/addPoints re-add cycles. See [#285](https://github.com/jlblancoc/nanoflann/pull/285).
+ - Fix: divideTree assertion failure with dynamic adaptor removePoint/addPoints. See [#283](https://github.com/jlblancoc/nanoflann/pull/283).
+ - CI: Added Windows (MSVC + clang-cl) and macOS (14+15) workflows; extended tested C++ standards.
+ - Docs: Consolidated macro list and documented threading guarantees.
+
 # nanoflann 1.8.0: Released Nov 16, 2025
  - Some minor performance optimization changes. See [#271](https://github.com/jlblancoc/nanoflann/issues/271).
  - New API: findWithinBox(). See [#272](https://github.com/jlblancoc/nanoflann/pull/272).
