@@ -1,7 +1,3 @@
-# Modern CMake minimum requirement
-cmake_minimum_required(VERSION 3.14)
-project(tests)
-
 # Fix a "bug" in VS11 (MSVC 2012):
 if(MSVC)
     add_compile_definitions(_VARIADIC_MAX=10)
@@ -14,8 +10,7 @@ if(NANOFLANN_USE_SYSTEM_GTEST)
 else()
     # EXCLUDE_FROM_ALL prevents gtest from being installed with your project
     add_subdirectory(gtest-1.8.0 EXCLUDE_FROM_ALL)
-    
-    # Use the target defined by your local gtest
+
     set(GTEST_TARGET mygtest)
 
     # Mark local GTest headers as SYSTEM to suppress pedantic warnings from them
@@ -26,36 +21,25 @@ else()
     endif()
 endif()
 
-# Test Project Executable
-add_executable(unit_tests test_main.cpp)
-set_target_properties(unit_tests PROPERTIES FOLDER "./")
+# Test executable
+add_executable(nanoflann_unit_tests test_main.cpp)
+set_target_properties(nanoflann_unit_tests PROPERTIES FOLDER "./")
 
-# ----------------------------------------------------------------------------
-# STRICT WARNINGS - Scoped specifically to the unit_tests target
-# ----------------------------------------------------------------------------
 if(MSVC)
-    target_compile_options(unit_tests PRIVATE /W4)
+    target_compile_options(nanoflann_unit_tests PRIVATE /W4)
 else()
-    target_compile_options(unit_tests PRIVATE 
-        -Wall 
-        -Wextra 
-        -Wpedantic 
-        -Wconversion 
-        -Wshadow
+    target_compile_options(nanoflann_unit_tests PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow
     )
 endif()
 
-# Standard Cross-Platform Threading
 find_package(Threads REQUIRED)
 
-# Link necessary libraries
-target_link_libraries(unit_tests 
-    PRIVATE 
-        ${GTEST_TARGET} 
-        nanoflann
+target_link_libraries(nanoflann_unit_tests
+    PRIVATE
+        ${GTEST_TARGET}
+        nanoflann::nanoflann
         Threads::Threads
 )
 
-# Register with CTest
-include(CTest)
-add_test(NAME unit_tests_run COMMAND unit_tests)
+add_test(NAME nanoflann_unit_tests COMMAND nanoflann_unit_tests)

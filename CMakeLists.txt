@@ -113,10 +113,19 @@ if(NANOFLANN_BUILD_EXAMPLES)
 endif()
 
 # Tests
+# BUILD_TESTING is the standard CTest/ROS build-farm knob; default ON.
+# NANOFLANN_BUILD_TESTS is kept for backwards compatibility.
+include(CTest)
 option(NANOFLANN_BUILD_TESTS "Build unit tests" ON)
-option(NANOFLANN_USE_SYSTEM_GTEST "Use system GTest dependency" OFF)
-if(NANOFLANN_BUILD_TESTS)
-  enable_testing()
+# Use system GTest when the ROS build farm is driving (it always provides it),
+# or when the user explicitly requests it.
+if("$ENV{ROS_VERSION}" STREQUAL "1" OR "$ENV{ROS_VERSION}" STREQUAL "2")
+  set(_nanoflann_system_gtest_default ON)
+else()
+  set(_nanoflann_system_gtest_default OFF)
+endif()
+option(NANOFLANN_USE_SYSTEM_GTEST "Use system GTest dependency" ${_nanoflann_system_gtest_default})
+if(BUILD_TESTING AND NANOFLANN_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
