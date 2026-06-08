@@ -2,6 +2,23 @@
 Changelog for package nanoflann
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* Merge pull request `#303 <https://github.com/jlblancoc/nanoflann/issues/303>`_ from jlblancoc/refactor/tests-smaller-files
+  refactor: unit tests into smaller files
+* refactor: unit tests into smaller files
+* CHANGELOG: ported to rst format for ROS tools compatibility
+* doc: update outdated COPYING dates
+* docs: add readme build badges
+* docs: add ROS build farm badge table to README
+* Add ROS package.xml and integrate BUILD_TESTING for ROS build farm
+  - package.xml: plain cmake build_type, BSD-2-Clause, libgtest-dev test_depend
+  - CMakeLists.txt: include(CTest), use BUILD_TESTING guard, auto-select
+  system GTest when ROS_VERSION env is set
+  - tests/CMakeLists.txt: remove redundant project(), rename test target to
+  nanoflann_unit_tests to avoid collisions in workspaces
+* Contributors: Jose Luis Blanco-Claraco
+
 1.10.0 (2026-06-06)
 --------------------
 * New: Incremental self-balancing dynamic k-d tree index (``KDTreeSingleIndexIncrementalAdaptor``), both single-threaded and multithreaded variants (`#302 <https://github.com/jlblancoc/nanoflann/pull/302>`_).
