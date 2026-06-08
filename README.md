@@ -32,7 +32,7 @@ Cite as:
 }
 ```
 
-See the release [CHANGELOG](CHANGELOG.md) for a list of project changes.
+See the release [CHANGELOG](CHANGELOG.rst) for a list of project changes.
 
 ### 1.1. Obtaining the code
 
