@@ -67,6 +67,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>  // std::chrono (async incremental index polling)
 #include <cmath>  // for abs()
 #include <cstdint>
 #include <cstdio>  // snprintf
@@ -74,7 +75,6 @@
 #include <functional>  // std::reference_wrapper
 #include <future>
 #include <istream>
-#include <chrono>  // std::chrono (async incremental index polling)
 #include <limits>  // std::numeric_limits
 #include <memory>  // std::unique_ptr (async incremental index)
 #include <new>  // placement new (incremental index node pool)
@@ -735,8 +735,8 @@ struct SO2_Adaptor
     template <typename U, typename V>
     inline DistanceType accum_dist(const U a, const V b, const size_t) const
     {
-        DistanceType diff = static_cast<DistanceType>(b) - static_cast<DistanceType>(a);
-        const DistanceType PI = pi_const<DistanceType>();
+        DistanceType       diff = static_cast<DistanceType>(b) - static_cast<DistanceType>(a);
+        const DistanceType PI   = pi_const<DistanceType>();
         if (diff > PI)
             diff -= 2 * PI;
         else if (diff < -PI)
@@ -1153,8 +1153,14 @@ class KDTreeBaseClass
     NANOFLANN_NODISCARD Size veclen(const Derived& obj) const noexcept
     {
 #if defined(__cpp_if_constexpr) && __cpp_if_constexpr >= 201606L
-        if constexpr (DIM > 0) { return DIM; }
-        else { return obj.dim_; }
+        if constexpr (DIM > 0)
+        {
+            return DIM;
+        }
+        else
+        {
+            return obj.dim_;
+        }
 #else
         return DIM > 0 ? DIM : obj.dim_;
 #endif
@@ -1204,7 +1210,7 @@ class KDTreeBaseClass
      *  correct for both the static and dynamic adaptors. */
     void computeBoundingBox(BoundingBox& bbox)
     {
-        Derived&   obj  = static_cast<Derived&>(*this);
+        Derived&        obj  = static_cast<Derived&>(*this);
         const Dimension dims = static_cast<Dimension>(veclen(obj));
         resize(bbox, dims);
         if (obj.dataset_.kdtree_get_bbox(bbox)) return;
@@ -1473,7 +1479,7 @@ class KDTreeBaseClass
         DistanceType& cutval, const BoundingBox& bbox)
     {
         const Dimension dims = static_cast<Dimension>(veclen(obj));
-        const auto EPS  = static_cast<DistanceType>(0.00001);
+        const auto      EPS  = static_cast<DistanceType>(0.00001);
 
         // Pre-compute max_span once
         ElementType max_span = bbox[0].high - bbox[0].low;
@@ -2398,9 +2404,7 @@ class KDTreeSingleIndexDynamicAdaptor_
         // fixed or variable-sized container (depending on DIM)
         distance_vector_t dists;
         // Fill it with zeros.
-        assign(
-            dists, this->veclen(*this),
-            static_cast<typename distance_vector_t::value_type>(0));
+        assign(dists, this->veclen(*this), static_cast<typename distance_vector_t::value_type>(0));
         DistanceType dist = this->computeInitialDistances(*this, vec, dists);
         this->searchLevel(result, vec, Base::root_node_, dist, dists, epsError);
 
@@ -2793,15 +2797,15 @@ class KDTreeSingleIndexIncrementalAdaptor
      *  metadata. Children pointers are nullptr at the leaves. */
     struct INode
     {
-        IndexType ptIdx        = 0;  //!< index of the stored data point
-        Dimension divfeat      = 0;  //!< splitting axis at this node
-        bool      deleted      = false;  //!< this node's point is tombstoned
-        bool      treeDeleted  = false;  //!< whole subtree lazily tombstoned
-        INode*    child1       = nullptr;  //!< "< split" child (also free-list link)
-        INode*    child2       = nullptr;  //!< ">= split" child
-        INode*    parent       = nullptr;  //!< parent (nullptr at the root)
-        Size      subtree_size = 0;  //!< number of nodes in this subtree
-        Size      invalid_count = 0;  //!< number of tombstoned nodes in subtree
+        IndexType   ptIdx         = 0;  //!< index of the stored data point
+        Dimension   divfeat       = 0;  //!< splitting axis at this node
+        bool        deleted       = false;  //!< this node's point is tombstoned
+        bool        treeDeleted   = false;  //!< whole subtree lazily tombstoned
+        INode*      child1        = nullptr;  //!< "< split" child (also free-list link)
+        INode*      child2        = nullptr;  //!< ">= split" child
+        INode*      parent        = nullptr;  //!< parent (nullptr at the root)
+        Size        subtree_size  = 0;  //!< number of nodes in this subtree
+        Size        invalid_count = 0;  //!< number of tombstoned nodes in subtree
         BoundingBox box;  //!< AABB of all points (live+dead) in this subtree
         //! Cache of this node's own point coordinates, kept in-node to avoid the
         //! dataset_get() indirection on the hot query / insert / box paths. Only
@@ -2982,18 +2986,12 @@ class KDTreeSingleIndexIncrementalAdaptor
 
     /** Append the live point indices (DFS, skipping tombstones) into \a out.
      *  Non-destructive; used to snapshot the tree for a background rebuild. */
-    void snapshotLiveIndices(std::vector<IndexType>& out) const
-    {
-        snapshotRec(iroot_, out);
-    }
+    void snapshotLiveIndices(std::vector<IndexType>& out) const { snapshotRec(iroot_, out); }
 
     /** Append EVERY physically-stored point index (live and tombstoned) into
      *  \a out. Used by the multi-threaded wrapper to detect which dataset slots
      *  become free after a background rebuild swap. */
-    void collectPhysicalIndices(std::vector<IndexType>& out) const
-    {
-        collectAllRec(iroot_, out);
-    }
+    void collectPhysicalIndices(std::vector<IndexType>& out) const { collectAllRec(iroot_, out); }
 
     /** True if some tree node currently references the given point index (i.e.
      *  the dataset slot is in use and must not be recycled). */
@@ -3069,12 +3067,9 @@ class KDTreeSingleIndexIncrementalAdaptor
         const DistanceType epsError = 1 + static_cast<DistanceType>(searchParams.eps);
 
         distance_vector_t dists;
-        assign(
-            dists, this->veclen(*this),
-            static_cast<typename distance_vector_t::value_type>(0));
+        assign(dists, this->veclen(*this), static_cast<typename distance_vector_t::value_type>(0));
         const DistanceType dist = this->computeInitialDistances(*this, vec, dists);
-        searchLevelInc(
-            result, vec, iroot_, dist, dists, epsError, this->veclen(*this));
+        searchLevelInc(result, vec, iroot_, dist, dists, epsError, this->veclen(*this));
         if (searchParams.sorted) result.sort();
         return result.full();
     }
@@ -3140,7 +3135,7 @@ class KDTreeSingleIndexIncrementalAdaptor
     {
         if (freeList_)
         {
-            INode* n = freeList_;
+            INode* n  = freeList_;
             freeList_ = n->child1;
             return n;  // already constructed; box storage reused
         }
@@ -3208,10 +3203,7 @@ class KDTreeSingleIndexIncrementalAdaptor
     // --------------------------------------------------------------------
     //  Helpers
     // --------------------------------------------------------------------
-    ElementType pt(IndexType idx, Dimension d) const
-    {
-        return dataset_.kdtree_get_pt(idx, d);
-    }
+    ElementType pt(IndexType idx, Dimension d) const { return dataset_.kdtree_get_pt(idx, d); }
 
     void ensureNodeMap(IndexType idx)
     {
@@ -3291,16 +3283,16 @@ class KDTreeSingleIndexIncrementalAdaptor
     // --------------------------------------------------------------------
     INode* makeLeaf(IndexType idx, Dimension depth, INode* parent)
     {
-        INode* n = allocNode();
+        INode*          n    = allocNode();
         const Dimension dims = static_cast<Dimension>(this->veclen(*this));
-        n->ptIdx        = idx;
-        n->divfeat      = static_cast<Dimension>(depth % dims);
-        n->deleted      = false;
-        n->treeDeleted  = false;
+        n->ptIdx             = idx;
+        n->divfeat           = static_cast<Dimension>(depth % dims);
+        n->deleted           = false;
+        n->treeDeleted       = false;
         n->child1 = n->child2 = nullptr;
-        n->parent       = parent;
-        n->subtree_size = 1;
-        n->invalid_count = 0;
+        n->parent             = parent;
+        n->subtree_size       = 1;
+        n->invalid_count      = 0;
         initBoxToPoint(n);
         cacheCoords(n);
         nodeOfPoint_[idx] = n;
@@ -3567,12 +3559,12 @@ class KDTreeSingleIndexIncrementalAdaptor
             buf.begin() + lo, buf.begin() + mid, buf.begin() + hi,
             [this, axis](IndexType a, IndexType b) { return pt(a, axis) < pt(b, axis); });
 
-        INode* node      = allocNode();
-        node->ptIdx      = buf[mid];
-        node->divfeat    = axis;
-        node->deleted    = false;
+        INode* node       = allocNode();
+        node->ptIdx       = buf[mid];
+        node->divfeat     = axis;
+        node->deleted     = false;
         node->treeDeleted = false;
-        node->parent     = parent;
+        node->parent      = parent;
         cacheCoords(node);
         nodeOfPoint_[buf[mid]] = node;
 
@@ -3722,8 +3714,8 @@ class KDTreeSingleIndexIncrementalAdaptorMT
     }
 
     KDTreeSingleIndexIncrementalAdaptorMT(const KDTreeSingleIndexIncrementalAdaptorMT&) = delete;
-    KDTreeSingleIndexIncrementalAdaptorMT& operator=(
-        const KDTreeSingleIndexIncrementalAdaptorMT&) = delete;
+    KDTreeSingleIndexIncrementalAdaptorMT& operator=(const KDTreeSingleIndexIncrementalAdaptorMT&) =
+        delete;
 
     ~KDTreeSingleIndexIncrementalAdaptorMT()
     {
@@ -3779,7 +3771,7 @@ class KDTreeSingleIndexIncrementalAdaptorMT
     Size radiusSearch(
         const ElementType* query_point, const DistanceType& radius,
         std::vector<ResultItem<IndexType, DistanceType>>& IndicesDists,
-        const SearchParameters& sp = {}) const
+        const SearchParameters&                           sp = {}) const
     {
         return active_->radiusSearch(query_point, radius, IndicesDists, sp);
     }
@@ -3857,7 +3849,13 @@ class KDTreeSingleIndexIncrementalAdaptorMT
     /** @} */
 
    private:
-    enum class OpKind { Add, Remove, RemoveBox, RemoveOutsideBox };
+    enum class OpKind
+    {
+        Add,
+        Remove,
+        RemoveBox,
+        RemoveOutsideBox
+    };
     struct LoggedOp
     {
         OpKind      kind;
@@ -3882,10 +3880,10 @@ class KDTreeSingleIndexIncrementalAdaptorMT
         const Dimension              d  = dim_;
         KDTreeIncrementalIndexParams p  = params_;
         std::function<void(Inner&)>  cb = rebuildCallback_;
-        fut_ = std::async(
-            std::launch::async,
-            [snapshot, &ds, d, p, cb]() -> std::unique_ptr<Inner>
-            {
+        fut_                            = std::async(
+                                       std::launch::async,
+                                       [snapshot, &ds, d, p, cb]() -> std::unique_ptr<Inner>
+                                       {
                 std::unique_ptr<Inner> t(new Inner(d, ds, p));
                 t->setInlineRebuild(false);
                 t->buildFromIndices(*snapshot);
@@ -3908,10 +3906,18 @@ class KDTreeSingleIndexIncrementalAdaptorMT
         {
             switch (op.kind)
             {
-                case OpKind::Add: fresh->addPoints(op.a, op.b); break;
-                case OpKind::Remove: fresh->removePoint(op.a); break;
-                case OpKind::RemoveBox: fresh->removeBox(op.box); break;
-                case OpKind::RemoveOutsideBox: fresh->removeOutsideBox(op.box); break;
+                case OpKind::Add:
+                    fresh->addPoints(op.a, op.b);
+                    break;
+                case OpKind::Remove:
+                    fresh->removePoint(op.a);
+                    break;
+                case OpKind::RemoveBox:
+                    fresh->removeBox(op.box);
+                    break;
+                case OpKind::RemoveOutsideBox:
+                    fresh->removeOutsideBox(op.box);
+                    break;
             }
         }
         log_.clear();
@@ -3941,9 +3947,9 @@ class KDTreeSingleIndexIncrementalAdaptorMT
     Size                                lastBuildLive_ = 0;
     std::vector<LoggedOp>               log_;
 
-    bool                                collectRemoved_ = false;
-    std::vector<IndexType>              removedSink_;
-    std::function<void(Inner&)>         rebuildCallback_;
+    bool                        collectRemoved_ = false;
+    std::vector<IndexType>      removedSink_;
+    std::function<void(Inner&)> rebuildCallback_;
 };
 #endif  // NANOFLANN_NO_THREADS
 
