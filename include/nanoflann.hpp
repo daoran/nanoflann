@@ -86,9 +86,9 @@
 #include <vector>
 
 /** Library version as a decimal string "MAJOR.MINOR.PATCH" */
-#define NANOFLANN_VERSION_STRING "1.10.0"
+#define NANOFLANN_VERSION_STRING "1.10.1"
 /** Library version: 0xMMmmPP (MM=Major, mm=minor, PP=patch) */
-#define NANOFLANN_VERSION 0x010A00
+#define NANOFLANN_VERSION 0x010A01
 
 // Avoid conflicting declaration of min/max macros in Windows headers
 #if !defined(NOMINMAX) && (defined(_WIN32) || defined(_WIN32_) || defined(WIN32) || defined(_WIN64))
