@@ -2,8 +2,8 @@
 Changelog for package nanoflann
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+1.10.1 (2026-06-09)
+-------------------
 * Merge pull request `#303 <https://github.com/jlblancoc/nanoflann/issues/303>`_ from jlblancoc/refactor/tests-smaller-files
   refactor: unit tests into smaller files
 * refactor: unit tests into smaller files
